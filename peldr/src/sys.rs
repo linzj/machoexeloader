@@ -89,6 +89,74 @@ unsafe extern "system" {
             unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
         >,
     ) -> *mut c_void;
+
+    pub fn GetCurrentProcessId() -> u32;
+    pub fn GetCurrentProcess() -> Handle;
+    pub fn CloseHandle(hObject: Handle) -> i32;
+    pub fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> Handle;
+    pub fn Thread32First(hSnapshot: Handle, lpte: *mut ThreadEntry32) -> i32;
+    pub fn Thread32Next(hSnapshot: Handle, lpte: *mut ThreadEntry32) -> i32;
+    pub fn OpenThread(dwDesiredAccess: u32, bInheritHandle: i32, dwThreadId: u32) -> Handle;
+}
+
+#[repr(C)]
+pub struct ThreadEntry32 {
+    pub dw_size: u32,
+    pub cnt_usage: u32,
+    pub th32_thread_id: u32,
+    pub th32_owner_process_id: u32,
+    pub tp_base_pri: i32,
+    pub cnt_priority_class: u32,
+    pub cnt_priority: u32,
+}
+
+/// (tid, Win32 start address) for every thread of the current process.
+/// Used by diagnostics: threads we never bootstrapped (and thus never gave a
+/// target TLS array to) stand out with a start address in target code.
+pub fn thread_audit() -> Vec<(u32, usize)> {
+    let mut v = Vec::new();
+    const TH32CS_SNAPTHREAD: u32 = 0x4;
+    const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0040;
+    const THREAD_QUERY_SET_WIN32_START_ADDRESS: u32 = 9;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap as isize == -1 {
+            return v;
+        }
+        let pid = GetCurrentProcessId();
+        let ntq = ntdll_proc("NtQueryInformationThread");
+        let mut te: ThreadEntry32 = std::mem::zeroed();
+        te.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;
+        if Thread32First(snap, &mut te) != 0 {
+            loop {
+                if te.th32_owner_process_id == pid {
+                    let h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, te.th32_thread_id);
+                    let mut start: usize = 0;
+                    if !h.is_null() {
+                        if let Some(f) = ntq {
+                            let f: unsafe extern "system" fn(Handle, u32, *mut c_void, u32, *mut u32) -> i32 =
+                                std::mem::transmute(f);
+                            let mut ret = 0u32;
+                            f(
+                                h,
+                                THREAD_QUERY_SET_WIN32_START_ADDRESS,
+                                &mut start as *mut usize as *mut c_void,
+                                std::mem::size_of::<usize>() as u32,
+                                &mut ret,
+                            );
+                        }
+                        CloseHandle(h);
+                    }
+                    v.push((te.th32_thread_id, start));
+                }
+                if Thread32Next(snap, &mut te) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    v
 }
 
 #[repr(C)]

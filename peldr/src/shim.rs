@@ -58,6 +58,10 @@ static REAL_WSA_STARTUP: AtomicUsize = AtomicUsize::new(0);
 static REAL_GET_HOST_NAME_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_WGETMAINARGS: AtomicUsize = AtomicUsize::new(0);
 static REAL_REGISTER_WAIT: AtomicUsize = AtomicUsize::new(0);
+static REAL_UNREGISTER_WAIT: AtomicUsize = AtomicUsize::new(0);
+static REAL_UNREGISTER_WAIT_EX: AtomicUsize = AtomicUsize::new(0);
+static REAL_READ_CONSOLE_INPUT_W: AtomicUsize = AtomicUsize::new(0);
+static REAL_NT_CREATE_THREAD_EX: AtomicUsize = AtomicUsize::new(0);
 static REAL_RTL_EXIT_USER_THREAD: AtomicUsize = AtomicUsize::new(0);
 static REAL_RTL_EXIT_USER_PROCESS: AtomicUsize = AtomicUsize::new(0);
 static REAL_FREE_LIBRARY_AND_EXIT_THREAD: AtomicUsize = AtomicUsize::new(0);
@@ -91,6 +95,12 @@ pub fn init_reals() {
     set(&REAL_GET_COMMAND_LINE_W, "GetCommandLineW");
     set(&REAL_GET_COMMAND_LINE_A, "GetCommandLineA");
     set(&REAL_REGISTER_WAIT, "RegisterWaitForSingleObject");
+    set(&REAL_UNREGISTER_WAIT, "UnregisterWait");
+    set(&REAL_UNREGISTER_WAIT_EX, "UnregisterWaitEx");
+    set(&REAL_READ_CONSOLE_INPUT_W, "ReadConsoleInputW");
+    if let Some(p) = sys::ntdll_proc("NtCreateThreadEx") {
+        REAL_NT_CREATE_THREAD_EX.store(p, Ordering::Relaxed);
+    }
     set(&REAL_FREE_LIBRARY_AND_EXIT_THREAD, "FreeLibraryAndExitThread");
     if let Some(p) = sys::ntdll_proc("RtlExitUserThread") {
         REAL_RTL_EXIT_USER_THREAD.store(p, Ordering::Relaxed);
@@ -455,15 +465,23 @@ fn runtime_load_inner(name: &str) -> Result<Option<usize>, String> {
     vlog!("shim: runtime self-mapping {}", path.display());
     let img_name = crate::loader::file_name_lower(&path);
     let img = crate::image::Image::map(pe, ImageKind::SelfDll, img_name.clone(), false)?;
-    if let Some(t) = &img.tls {
-        if t.index_rva != 0 || t.template_size > 0 {
-            crate::rerr!("runtime DLL {img_name} has a TLS directory; its thread-locals are not supported");
-        }
-    }
     bind_runtime_image(&img)?;
     img.reprotect()?;
     if let Some((addr, count)) = img.pdata_addr() {
         let _ = sys::rtl_add_function_table(addr, count, img.base as u64);
+    }
+    // After the IAT is bound: TLS (callbacks run the DLL's own init code),
+    // then the DLL entry point with DLL_PROCESS_ATTACH — a static-CRT plugin
+    // needs its CRT initialized exactly like a real LoadLibrary would.
+    crate::tls::register_runtime_image(&img)?;
+    let entry = img.addr_of(img.pe().entry_rva);
+    if entry != 0 {
+        let dllmain: unsafe extern "system" fn(usize, u32, usize) -> i32 =
+            unsafe { std::mem::transmute(entry) };
+        vlog!("shim: calling DllMain {entry:#x} (DLL_PROCESS_ATTACH) for {img_name}");
+        if unsafe { dllmain(img.base, 1, 0) } == 0 {
+            return Err(format!("runtime DLL {img_name}: DllMain(DLL_PROCESS_ATTACH) failed"));
+        }
     }
     let base = img.base;
     v.images.lock().unwrap().push(ViewImage {
@@ -655,6 +673,7 @@ struct ThreadStart {
 }
 
 struct WaitStart {
+    object: usize,
     cb: usize,
     ctx: *mut c_void,
 }
@@ -665,6 +684,12 @@ struct WaitStart {
 /// afterwards: pool threads are reused for non-target work.
 unsafe extern "system" fn waiter_bootstrap(param: *mut c_void, fired: u8) {
     let ws = unsafe { Box::from_raw(param as *mut WaitStart) };
+    vlog!(
+        "shim: waiter fire (object {:#x}, cb {:#x}, fired {fired}) tid {}",
+        ws.object,
+        ws.cb,
+        unsafe { sys::GetCurrentThreadId() }
+    );
     if let Err(e) = crate::tls::attach_reusable_thread() {
         crate::rerr!("TLS setup failed on pool thread: {e}");
     }
@@ -684,17 +709,17 @@ extern "system" fn shim_register_wait(
 ) -> i32 {
     let f: unsafe extern "system" fn(*mut Handle, Handle, usize, *mut c_void, u32, u32) -> i32 =
         unsafe { std::mem::transmute(REAL_REGISTER_WAIT.load(Ordering::Relaxed)) };
-    vlog!(
-        "shim: RegisterWaitForSingleObject(object {object:p}, cb {callback:#x}, flags {flags:#x}, ms {milliseconds})"
-    );
     if callback == 0 {
-        return unsafe { f(new_wait, object, 0, context, milliseconds, flags) };
+        let rc = unsafe { f(new_wait, object, 0, context, milliseconds, flags) };
+        vlog!("shim: RegisterWaitForSingleObject(object {object:p}, cb null) -> {rc}");
+        return rc;
     }
     let ws = Box::into_raw(Box::new(WaitStart {
+        object: object as usize,
         cb: callback,
         ctx: context,
     }));
-    unsafe {
+    let rc = unsafe {
         f(
             new_wait,
             object,
@@ -703,7 +728,129 @@ extern "system" fn shim_register_wait(
             milliseconds,
             flags,
         )
+    };
+    let err = unsafe { sys::GetLastError() };
+    let ft = unsafe { sys::GetFileType(object) };
+    let mut mode = 0u32;
+    let cm = unsafe { sys::GetConsoleMode(object, &mut mode) };
+    vlog!(
+        "shim: RegisterWaitForSingleObject(object {object:p}, cb {callback:#x}, flags {flags:#x}, ms {milliseconds}) -> {rc} err {err} filetype {ft} conmode {cm}/{mode:#x}"
+    );
+    rc
+}
+
+extern "system" fn shim_unregister_wait(wait: Handle, completion_event: Handle) -> i32 {
+    let f: unsafe extern "system" fn(Handle, Handle) -> i32 =
+        unsafe { std::mem::transmute(REAL_UNREGISTER_WAIT.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(wait, completion_event) };
+    vlog!("shim: UnregisterWait(wait {wait:p}, event {completion_event:p}) -> {rc}");
+    rc
+}
+
+extern "system" fn shim_unregister_wait_ex(wait: Handle, completion_event: Handle, flags: u32) -> i32 {
+    let f: unsafe extern "system" fn(Handle, Handle, u32) -> i32 =
+        unsafe { std::mem::transmute(REAL_UNREGISTER_WAIT_EX.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(wait, completion_event, flags) };
+    vlog!("shim: UnregisterWaitEx(wait {wait:p}, event {completion_event:p}, flags {flags:#x}) -> {rc}");
+    rc
+}
+
+extern "system" fn shim_read_console_input_w(
+    h: Handle,
+    records: *mut c_void,
+    len: u32,
+    read: *mut u32,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, *mut c_void, u32, *mut u32) -> i32 =
+        unsafe { std::mem::transmute(REAL_READ_CONSOLE_INPUT_W.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(h, records, len, read) };
+    let n = if read.is_null() { 0 } else { unsafe { *read } };
+    if rc == 0 || n > 0 {
+        let err = unsafe { sys::GetLastError() };
+        vlog!(
+            "shim: ReadConsoleInputW({h:p}, len {len}) -> {rc} err {err} events {n} tid {}",
+            unsafe { sys::GetCurrentThreadId() }
+        );
     }
+    rc
+}
+
+/// NtCreateThreadEx is how Bun's zig runtime and some native plugins spawn
+/// threads, bypassing kernel32!CreateThread entirely. Without wrapping, the
+/// new thread never gets a target TLS array: its slot 0 (which Bun reaches
+/// via a hardcoded fs:[58h] load) holds host state, and the first TLS access
+/// dereferences garbage. Wrap the start routine exactly like CreateThread.
+extern "system" fn shim_nt_create_thread_ex(
+    thread_handle: *mut Handle,
+    desired_access: u32,
+    object_attributes: *mut c_void,
+    process_handle: Handle,
+    start_routine: usize,
+    argument: *mut c_void,
+    create_flags: u32,
+    zero_bits: usize,
+    stack_size: usize,
+    maximum_stack_size: usize,
+    attribute_list: *mut c_void,
+) -> i32 {
+    let f: unsafe extern "system" fn(
+        *mut Handle,
+        u32,
+        *mut c_void,
+        Handle,
+        usize,
+        *mut c_void,
+        u32,
+        usize,
+        usize,
+        usize,
+        *mut c_void,
+    ) -> i32 = unsafe { std::mem::transmute(REAL_NT_CREATE_THREAD_EX.load(Ordering::Relaxed)) };
+    let self_proc = unsafe { sys::GetCurrentProcess() };
+    if start_routine == 0
+        || (process_handle != self_proc && process_handle as isize != -1)
+    {
+        return unsafe {
+            f(
+                thread_handle,
+                desired_access,
+                object_attributes,
+                process_handle,
+                start_routine,
+                argument,
+                create_flags,
+                zero_bits,
+                stack_size,
+                maximum_stack_size,
+                attribute_list,
+            )
+        };
+    }
+    let ts = Box::into_raw(Box::new(ThreadStart {
+        start: start_routine,
+        param: argument,
+    }));
+    let rc = unsafe {
+        f(
+            thread_handle,
+            desired_access,
+            object_attributes,
+            process_handle,
+            thread_bootstrap as *const () as usize,
+            ts as *mut c_void,
+            create_flags,
+            zero_bits,
+            stack_size,
+            maximum_stack_size,
+            attribute_list,
+        )
+    };
+    if rc < 0 {
+        let _ = unsafe { Box::from_raw(ts) };
+    } else {
+        vlog!("shim: NtCreateThreadEx(start {start_routine:#x}) wrapped");
+    }
+    rc
 }
 
 unsafe extern "system" fn thread_bootstrap(p: *mut c_void) -> u32 {
@@ -712,6 +859,7 @@ unsafe extern "system" fn thread_bootstrap(p: *mut c_void) -> u32 {
     if let Err(e) = crate::tls::attach_current_thread() {
         crate::rerr!("TLS setup failed on new thread: {e}");
     }
+    crate::tls::run_thread_attach_callbacks();
     vlog!("shim: thread attached, calling target start {:#x}", ts.start);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(ts.start) };
     let r = unsafe { f(ts.param) };
@@ -916,6 +1064,15 @@ extern "system" fn shim_get_command_line_a() -> *const u8 {
 // that only looks like a loader-loaded process.
 extern "system" fn shim_exit_process(code: u32) -> ! {
     vlog!("shim: ExitProcess({code}) on tid {}", unsafe { sys::GetCurrentThreadId() });
+    if crate::diag::verbose() {
+        for (tid, start) in sys::thread_audit() {
+            let tracked = crate::tls::is_thread_tracked(tid);
+            vlog!(
+                "exit audit: tid {tid} start {start:#x} {}",
+                if tracked { "tracked" } else { "UNTRACKED" }
+            );
+        }
+    }
     sys::terminate_self(code)
 }
 
@@ -1136,6 +1293,9 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
                 "RtlExitUserProcess" if have(&REAL_RTL_EXIT_USER_PROCESS) => {
                     cast(shim_rtl_exit_user_process as *const ())
                 }
+                "NtCreateThreadEx" if have(&REAL_NT_CREATE_THREAD_EX) => {
+                    cast(shim_nt_create_thread_ex as *const ())
+                }
                 _ => None,
             },
             ImportName::Ordinal(_) => None,
@@ -1193,6 +1353,15 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
             }
             "RegisterWaitForSingleObject" if have(&REAL_REGISTER_WAIT) => {
                 cast(shim_register_wait as *const ())
+            }
+            "UnregisterWait" if have(&REAL_UNREGISTER_WAIT) => {
+                cast(shim_unregister_wait as *const ())
+            }
+            "UnregisterWaitEx" if have(&REAL_UNREGISTER_WAIT_EX) => {
+                cast(shim_unregister_wait_ex as *const ())
+            }
+            "ReadConsoleInputW" if have(&REAL_READ_CONSOLE_INPUT_W) => {
+                cast(shim_read_console_input_w as *const ())
             }
             "ExitProcess" if have(&REAL_EXIT_PROCESS) => cast(shim_exit_process as *const ()),
             "ExitThread" if have(&REAL_EXIT_THREAD) => cast(shim_exit_thread as *const ()),

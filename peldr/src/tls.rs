@@ -391,6 +391,98 @@ fn migrate(st: &mut TlsState, new_count: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether this tid is one of the threads we bootstrapped (has a target
+/// TLS array). Diagnostic helper.
+pub fn is_thread_tracked(tid: u32) -> bool {
+    let guard = match STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let Some(st) = guard.as_ref() else { return false };
+    st.threads.iter().any(|r| r.tid == tid)
+}
+
+/// Register TLS for an image mapped after the target started (a runtime
+/// LoadLibrary self-map). It takes the next free DLL slot; the module's index
+/// is written, every tracked thread gets a fresh block (template copy) and a
+/// rebuilt array, so the module's thread-locals work on all threads. Its TLS
+/// callbacks then run with DLL_PROCESS_ATTACH (lpReserved=0: dynamic load).
+pub fn register_runtime_image(img: &Image) -> Result<(), String> {
+    let Some(t) = img.tls.as_ref() else { return Ok(()) };
+    if t.index_rva == 0 && t.template_size == 0 && t.callbacks_rva.is_none() {
+        return Ok(());
+    }
+    let mut guard = STATE.lock().unwrap();
+    let Some(st) = guard.as_mut() else { return Ok(()) };
+    maintain_locked(st)?;
+    let slot = st.base_slot + 1 + st.images.iter().filter(|i| !i.is_main).count();
+    let block_size = t.template_size as usize + t.zero_fill as usize;
+    let index_addr = if t.index_rva != 0 { img.addr_of(t.index_rva) } else { 0 };
+    if index_addr != 0 {
+        write_index(index_addr, slot)?;
+    }
+    let si = TlsImageInfo {
+        is_main: false,
+        base: img.base,
+        index_addr,
+        slot,
+        block_size,
+        template_addr: if t.template_size > 0 { img.addr_of(t.template_rva) } else { 0 },
+        template_size: t.template_size as usize,
+        callbacks_addr: t.callbacks_rva.map(|r| img.addr_of(r)),
+    };
+    vlog!(
+        "tls: runtime image {} -> slot {slot} (block {block_size:#x} bytes)",
+        img.name
+    );
+    let TlsState {
+        base_slot,
+        images,
+        threads,
+        ..
+    } = st;
+    images.push(si);
+    let si = images.last().unwrap();
+    for rec in threads.iter_mut() {
+        let b = alloc_block(si)?;
+        rec.blocks.push(b);
+        let cur = sys::tls_array_for(rec.teb);
+        let mut host: Vec<usize> = (0..*base_slot).map(|i| unsafe { *cur.add(i) }).collect();
+        // Our arrays keep the loader's block at [base]; build_array takes the
+        // loader block from host[0], so carry it over explicitly.
+        if !host.is_empty() {
+            host[0] = unsafe { *cur.add(*base_slot) };
+        }
+        let target_block = if rec.is_target {
+            images
+                .iter()
+                .position(|i| i.is_main)
+                .map(|k| rec.blocks[k])
+        } else {
+            None
+        };
+        let arr = build_array(images, *base_slot, &host, &rec.blocks, target_block);
+        let ours = leak_arr(arr) as usize;
+        rec.ours = ours;
+        sys::set_tls_array_for(rec.teb, ours as *mut usize);
+    }
+    // Module TLS callbacks, DLL_PROCESS_ATTACH with lpReserved=0 (dynamic load).
+    if let Some(a) = si.callbacks_addr {
+        let mut i = 0usize;
+        loop {
+            let f = unsafe { *((a + i * 8) as *const usize) };
+            if f == 0 || i > 128 {
+                break;
+            }
+            vlog!("tls: running runtime callback {f:#x} for image at {:#x}", img.base);
+            let cb: unsafe extern "system" fn(usize, u32, usize) = unsafe { std::mem::transmute(f) };
+            unsafe { cb(img.base, 1, 0) };
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 fn write_index(addr: usize, slot: usize) -> Result<(), String> {
     // May run after the image was reprotected read-only.
     let page = addr & !(sys::page_size() - 1);
@@ -419,10 +511,52 @@ fn alloc_block(si: &TlsImageInfo) -> Result<usize, String> {
 }
 
 fn leak_arr(arr: Vec<usize>) -> *mut usize {
-    Box::into_raw(arr.into_boxed_slice()) as *mut usize
+    // One leading slot stays 0: ntdll's LdrpHandleTlsData may "upgrade" a
+    // thread's TLS vector when a TLS-bearing host DLL loads, and frees the
+    // previous vector via RtlFreeHeap(LdrpTlsHeap, *(TlsArray - 8)). For our
+    // array that read lands on this guard slot, so the free becomes a
+    // harmless free(NULL) instead of a heap fail-fast.
+    let mut v = Vec::with_capacity(arr.len() + 1);
+    v.push(0usize);
+    v.extend_from_slice(&arr);
+    let raw = Box::into_raw(v.into_boxed_slice()) as *mut usize;
+    unsafe { raw.add(1) }
 }
 
-/// Run IMAGE_TLS_DIRECTORY callbacks with DLL_PROCESS_ATTACH. lpReserved != 0
+/// Run the TLS callbacks of all self-mapped images with DLL_THREAD_ATTACH.
+/// A real process runs these for every thread (ntdll does it from its own
+/// loader database); self-mapped images are invisible to ntdll, so our
+/// thread bootstraps must do it. Collected under the lock, run outside it --
+/// callbacks may call back into LoadLibrary and the TLS machinery.
+pub fn run_thread_attach_callbacks() {
+    let cbs: Vec<(usize, usize)> = {
+        let guard = match STATE.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(st) = guard.as_ref() else { return };
+        let mut v = Vec::new();
+        for si in &st.images {
+            let Some(a) = si.callbacks_addr else { continue };
+            let mut i = 0usize;
+            loop {
+                let f = unsafe { *((a + i * 8) as *const usize) };
+                if f == 0 || i > 128 {
+                    break;
+                }
+                v.push((f, si.base));
+                i += 1;
+            }
+        }
+        v
+    };
+    for (f, base) in cbs {
+        let cb: unsafe extern "system" fn(usize, u32, usize) = unsafe { std::mem::transmute(f) };
+        unsafe { cb(base, 2, 0) }; // DLL_THREAD_ATTACH
+    }
+}
+
+/// Run the TLS callbacks of ALL images with DLL_PROCESS_ATTACH. lpReserved != 0
 /// mirrors the "loaded at process start" semantics the target would see.
 pub fn run_callbacks() {
     let cbs: Vec<(usize, usize)> = {
