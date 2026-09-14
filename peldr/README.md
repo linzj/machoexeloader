@@ -66,6 +66,7 @@ peldr [-v] [-e] [-r] <目标> [args...]
 | `GetModuleFileNameA/W` | `NULL`/自映射 base → 返回目标路径 |
 | `GetCommandLineA/W` | 返回伪造的命令行(宿主 kernelbase 按首调缓存,必须自供) |
 | `CreateThread`、`_beginthreadex` | 包装 start routine:新线程先完成 TLS 数组重建 |
+| `RegisterWaitForSingleObject` | 回调跑在 ntdll 线程池线程上(不经 CreateThread),同样先重建 TLS,回调结束归还数组(Bun 的控制台输入读取走这条路) |
 | `ExitProcess`、`ExitThread`、`TerminateProcess`(自身) | 先还原 ntdll TLS 数组 / 硬退出 |
 
 诊断开关(环境变量,均为只读观测):`PELDR_TRACE_AV=1`(首次异常:寄存器+指令字节+栈转储+镜像内定位)、
@@ -110,6 +111,9 @@ peldr [-v] [-e] [-r] <目标> [args...]
   导入天然可用;目标无 CFG(实测 DllCharacteristics 无 GUARD_CF)。
 - **运行时自映射**:延迟加载/dynamic load 在运行时找目标旁的用户 DLL,现场解析+映射
   +绑定+注册 unwind(等价 load 期逻辑),宿主搜索路径完全不同的问题由此消除。
+- **线程池回调线程**:`RegisterWaitForSingleObject` 的回调在 ntdll 线程池线程上执行,
+  不经 CreateThread shim(Bun 的 TUI 控制台输入读取就挂在它上面);漏掉包裹会导致
+  回调读到加载器的 TLS 块 —— 表现为 TUI 渲染正常但无法输入、卡死。
 - **目标线程上的加载器代码禁止使用 Rust std 的 TLS 附带设施**(stdio/panic 展开路径
   内含 thread_local);运行期日志统一走裸 WriteFile(`vlog!`/`rerr!`),panic hook 同样
   裸写。v3 之后目标线程的 Rust TLS 已保持可用,但这层防御保留。
@@ -127,6 +131,7 @@ cd peldr && ./tests/run_tests.sh
 - `ctor` — CRT 构造器(`.CRT$XCU`,经 CRT `_initterm` 跑)
 - `tls` — `__declspec(thread)` 初值/BSS/读写
 - `threads` — `CreateThread` 与 `_beginthreadex` 双路径、每线程 TLS 隔离
+- `waiter` — `RegisterWaitForSingleObject` 线程池回调中的 TLS 访问
 - `modname` — PEB 伪造(`GetModuleFileNameW`/`GetModuleHandleW`/argv)
 - `greettest` — 依赖链:main → greet.dll → suffix.dll(自映射、跨模块 IAT)
 - `greettest_delay` — `/DELAYLOAD:greet.dll`(运行时自映射路径)

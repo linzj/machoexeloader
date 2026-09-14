@@ -57,6 +57,7 @@ static REAL_GET_COMMAND_LINE_A: AtomicUsize = AtomicUsize::new(0);
 static REAL_WSA_STARTUP: AtomicUsize = AtomicUsize::new(0);
 static REAL_GET_HOST_NAME_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_WGETMAINARGS: AtomicUsize = AtomicUsize::new(0);
+static REAL_REGISTER_WAIT: AtomicUsize = AtomicUsize::new(0);
 static REAL_EXIT_PROCESS: AtomicUsize = AtomicUsize::new(0);
 static REAL_EXIT_THREAD: AtomicUsize = AtomicUsize::new(0);
 static REAL_TERMINATE_PROCESS: AtomicUsize = AtomicUsize::new(0);
@@ -86,6 +87,7 @@ pub fn init_reals() {
     set(&REAL_GET_MODULE_FILE_NAME_A, "GetModuleFileNameA");
     set(&REAL_GET_COMMAND_LINE_W, "GetCommandLineW");
     set(&REAL_GET_COMMAND_LINE_A, "GetCommandLineA");
+    set(&REAL_REGISTER_WAIT, "RegisterWaitForSingleObject");
     set(&REAL_EXIT_PROCESS, "ExitProcess");
     set(&REAL_EXIT_THREAD, "ExitThread");
     set(&REAL_TERMINATE_PROCESS, "TerminateProcess");
@@ -639,6 +641,54 @@ struct ThreadStart {
     param: *mut c_void,
 }
 
+struct WaitStart {
+    cb: usize,
+    ctx: *mut c_void,
+}
+
+/// RegisterWaitForSingleObject callbacks run on ntdll thread-pool threads
+/// (created outside our CreateThread shim, e.g. Bun's console input reader).
+/// The TLS array must be rebuilt before target code runs and handed back
+/// afterwards: pool threads are reused for non-target work.
+unsafe extern "system" fn waiter_bootstrap(param: *mut c_void, fired: u8) {
+    let ws = unsafe { Box::from_raw(param as *mut WaitStart) };
+    if let Err(e) = crate::tls::attach_current_thread() {
+        crate::rerr!("TLS setup failed on pool thread: {e}");
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u8) = unsafe { std::mem::transmute(ws.cb) };
+    unsafe { f(ws.ctx, fired) };
+    crate::tls::restore_current_thread_array();
+}
+
+extern "system" fn shim_register_wait(
+    new_wait: *mut Handle,
+    object: Handle,
+    callback: usize,
+    context: *mut c_void,
+    milliseconds: u32,
+    flags: u32,
+) -> i32 {
+    let f: unsafe extern "system" fn(*mut Handle, Handle, usize, *mut c_void, u32, u32) -> i32 =
+        unsafe { std::mem::transmute(REAL_REGISTER_WAIT.load(Ordering::Relaxed)) };
+    if callback == 0 {
+        return unsafe { f(new_wait, object, 0, context, milliseconds, flags) };
+    }
+    let ws = Box::into_raw(Box::new(WaitStart {
+        cb: callback,
+        ctx: context,
+    }));
+    unsafe {
+        f(
+            new_wait,
+            object,
+            waiter_bootstrap as *const () as usize,
+            ws as *mut c_void,
+            milliseconds,
+            flags,
+        )
+    }
+}
+
 unsafe extern "system" fn thread_bootstrap(p: *mut c_void) -> u32 {
     vlog!("shim: thread start (bootstrap entered)");
     let ts = unsafe { Box::from_raw(p as *mut ThreadStart) };
@@ -1064,6 +1114,9 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
             }
             "GetCommandLineA" if have(&REAL_GET_COMMAND_LINE_A) => {
                 cast(shim_get_command_line_a as *const ())
+            }
+            "RegisterWaitForSingleObject" if have(&REAL_REGISTER_WAIT) => {
+                cast(shim_register_wait as *const ())
             }
             "ExitProcess" if have(&REAL_EXIT_PROCESS) => cast(shim_exit_process as *const ()),
             "ExitThread" if have(&REAL_EXIT_THREAD) => cast(shim_exit_thread as *const ()),
