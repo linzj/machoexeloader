@@ -62,6 +62,7 @@ run_case hello_classic
 run_case greettest
 
 # Claude Code native binary (207MB, Bun/JSC, 96k+ fixups, TLS).
+# Not in repo; prepare with: npm install --prefix tmp/claude-code @anthropic-ai/claude-code@2.1.270
 CLAUDE=tmp/claude-code/node_modules/@anthropic-ai/claude-code-darwin-arm64/claude
 if [ -f "$CLAUDE" ]; then
     # Load, map, fix up and bind everything without executing.
@@ -81,6 +82,8 @@ if [ -f "$CLAUDE" ]; then
         echo "FAIL claude-exec-version"
         fail=$((fail + 1))
     fi
+else
+    echo "SKIP claude-load-only/claude-exec-version: $CLAUDE not found (see README 验证 section)"
 fi
 
 echo "== $pass passed, $fail failed =="
