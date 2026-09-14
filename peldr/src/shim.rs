@@ -58,6 +58,9 @@ static REAL_WSA_STARTUP: AtomicUsize = AtomicUsize::new(0);
 static REAL_GET_HOST_NAME_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_WGETMAINARGS: AtomicUsize = AtomicUsize::new(0);
 static REAL_REGISTER_WAIT: AtomicUsize = AtomicUsize::new(0);
+static REAL_RTL_EXIT_USER_THREAD: AtomicUsize = AtomicUsize::new(0);
+static REAL_RTL_EXIT_USER_PROCESS: AtomicUsize = AtomicUsize::new(0);
+static REAL_FREE_LIBRARY_AND_EXIT_THREAD: AtomicUsize = AtomicUsize::new(0);
 static REAL_EXIT_PROCESS: AtomicUsize = AtomicUsize::new(0);
 static REAL_EXIT_THREAD: AtomicUsize = AtomicUsize::new(0);
 static REAL_TERMINATE_PROCESS: AtomicUsize = AtomicUsize::new(0);
@@ -88,6 +91,13 @@ pub fn init_reals() {
     set(&REAL_GET_COMMAND_LINE_W, "GetCommandLineW");
     set(&REAL_GET_COMMAND_LINE_A, "GetCommandLineA");
     set(&REAL_REGISTER_WAIT, "RegisterWaitForSingleObject");
+    set(&REAL_FREE_LIBRARY_AND_EXIT_THREAD, "FreeLibraryAndExitThread");
+    if let Some(p) = sys::ntdll_proc("RtlExitUserThread") {
+        REAL_RTL_EXIT_USER_THREAD.store(p, Ordering::Relaxed);
+    }
+    if let Some(p) = sys::ntdll_proc("RtlExitUserProcess") {
+        REAL_RTL_EXIT_USER_PROCESS.store(p, Ordering::Relaxed);
+    }
     set(&REAL_EXIT_PROCESS, "ExitProcess");
     set(&REAL_EXIT_THREAD, "ExitThread");
     set(&REAL_TERMINATE_PROCESS, "TerminateProcess");
@@ -590,6 +600,9 @@ extern "system" fn shim_get_proc_address(hmod: Handle, name: *const c_char) -> *
         return std::ptr::null_mut();
     } else {
         let s = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+        if let Some(a) = dynamic_override(&s) {
+            return a as *mut c_void;
+        }
         (hmod as usize, s)
     };
     let mut guard = GET_PROC_CACHE.lock().unwrap();
@@ -652,11 +665,12 @@ struct WaitStart {
 /// afterwards: pool threads are reused for non-target work.
 unsafe extern "system" fn waiter_bootstrap(param: *mut c_void, fired: u8) {
     let ws = unsafe { Box::from_raw(param as *mut WaitStart) };
-    if let Err(e) = crate::tls::attach_current_thread() {
+    if let Err(e) = crate::tls::attach_reusable_thread() {
         crate::rerr!("TLS setup failed on pool thread: {e}");
     }
     let f: unsafe extern "system" fn(*mut c_void, u8) = unsafe { std::mem::transmute(ws.cb) };
     unsafe { f(ws.ctx, fired) };
+    vlog!("shim: waiter tail (tid {}) callback done", unsafe { sys::GetCurrentThreadId() });
     crate::tls::restore_current_thread_array();
 }
 
@@ -699,6 +713,7 @@ unsafe extern "system" fn thread_bootstrap(p: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(ts.start) };
     let r = unsafe { f(ts.param) };
     // Hand ntdll back a normal-looking TLS array before this thread dies.
+    vlog!("shim: bootstrap tail (tid {}) target start returned {r}", unsafe { sys::GetCurrentThreadId() });
     crate::tls::restore_current_thread_array();
     vlog!("shim: target start returned {r}");
     r
@@ -897,14 +912,58 @@ extern "system" fn shim_get_command_line_a() -> *const u8 {
 // handlers; terminate hard so ntdll's teardown never walks TEB TLS state
 // that only looks like a loader-loaded process.
 extern "system" fn shim_exit_process(code: u32) -> ! {
+    vlog!("shim: ExitProcess({code}) on tid {}", unsafe { sys::GetCurrentThreadId() });
     sys::terminate_self(code)
 }
 
 extern "system" fn shim_exit_thread(code: u32) -> ! {
+    vlog!("shim: ExitThread({code}) on tid {}", unsafe { sys::GetCurrentThreadId() });
     crate::tls::restore_current_thread_array();
     let f: unsafe extern "system" fn(u32) -> ! =
         unsafe { std::mem::transmute(REAL_EXIT_THREAD.load(Ordering::Relaxed)) };
     unsafe { f(code) }
+}
+
+/// Bun exits its worker threads by calling ntdll!RtlExitUserThread directly
+/// (resolved through GetProcAddress, not the import table). Without the
+/// restore, ntdll's thread teardown frees TLS blocks against our array and
+/// corrupts the heap (silent fail-fast a moment later).
+extern "system" fn shim_rtl_exit_user_thread(status: u32) -> ! {
+    vlog!("shim: RtlExitUserThread({status}) on tid {}", unsafe { sys::GetCurrentThreadId() });
+    crate::tls::restore_current_thread_array();
+    let f: unsafe extern "system" fn(u32) -> ! =
+        unsafe { std::mem::transmute(REAL_RTL_EXIT_USER_THREAD.load(Ordering::Relaxed)) };
+    unsafe { f(status) }
+}
+
+extern "system" fn shim_rtl_exit_user_process(status: u32) -> ! {
+    sys::terminate_self(status)
+}
+
+extern "system" fn shim_free_library_and_exit_thread(h: Handle, code: u32) -> ! {
+    crate::tls::restore_current_thread_array();
+    let f: unsafe extern "system" fn(Handle, u32) -> ! =
+        unsafe { std::mem::transmute(REAL_FREE_LIBRARY_AND_EXIT_THREAD.load(Ordering::Relaxed)) };
+    unsafe { f(h, code) }
+}
+
+/// Names that must be intercepted even when resolved dynamically through
+/// GetProcAddress (Bun resolves the ntdll exit entry points that way).
+fn dynamic_override(name: &str) -> Option<usize> {
+    let have = |slot: &AtomicUsize| slot.load(Ordering::Relaxed) != 0;
+    match name {
+        "RtlExitUserThread" if have(&REAL_RTL_EXIT_USER_THREAD) => {
+            Some(shim_rtl_exit_user_thread as *const () as usize)
+        }
+        "RtlExitUserProcess" if have(&REAL_RTL_EXIT_USER_PROCESS) => {
+            Some(shim_rtl_exit_user_process as *const () as usize)
+        }
+        "ExitThread" if have(&REAL_EXIT_THREAD) => Some(shim_exit_thread as *const () as usize),
+        "ExitProcess" if have(&REAL_EXIT_PROCESS) => {
+            Some(shim_exit_process as *const () as usize)
+        }
+        _ => None,
+    }
 }
 
 extern "system" fn shim_terminate_process(h: Handle, code: u32) -> i32 {
@@ -1065,6 +1124,20 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
         || d.starts_with("msvcrt");
     let have = |slot: &AtomicUsize| slot.load(Ordering::Relaxed) != 0;
     let cast = |f: *const ()| Some(f as usize);
+    if d.starts_with("ntdll") {
+        return match func {
+            ImportName::Name(n) => match n.as_str() {
+                "RtlExitUserThread" if have(&REAL_RTL_EXIT_USER_THREAD) => {
+                    cast(shim_rtl_exit_user_thread as *const ())
+                }
+                "RtlExitUserProcess" if have(&REAL_RTL_EXIT_USER_PROCESS) => {
+                    cast(shim_rtl_exit_user_process as *const ())
+                }
+                _ => None,
+            },
+            ImportName::Ordinal(_) => None,
+        };
+    }
     if trace_exit() {
         match name {
             "exit" | "_exit" => return cast(shim_trace_exit as *const ()),
@@ -1120,6 +1193,9 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
             }
             "ExitProcess" if have(&REAL_EXIT_PROCESS) => cast(shim_exit_process as *const ()),
             "ExitThread" if have(&REAL_EXIT_THREAD) => cast(shim_exit_thread as *const ()),
+            "FreeLibraryAndExitThread" if have(&REAL_FREE_LIBRARY_AND_EXIT_THREAD) => {
+                cast(shim_free_library_and_exit_thread as *const ())
+            }
             "TerminateProcess" if have(&REAL_TERMINATE_PROCESS) => {
                 cast(shim_terminate_process as *const ())
             }

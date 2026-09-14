@@ -18,6 +18,11 @@
 //! entry count; no module ever unloads). If a host DLL with TLS loads later,
 //! ntdll claims slot C and reallocates thread arrays: maintain() then shifts
 //! the loader and DLL slots up and rebuilds our arrays.
+//!
+//! Teardown: ntdll frees TLS arrays and per-module blocks from its private
+//! LdrpTlsHeap, so at thread exit the TEB must not point at our process-heap
+//! array -- one-shot threads get it nulled (ntdll's teardown then skips all
+//! frees), pool threads get ntdll's own array back for reuse.
 
 use std::alloc::{alloc, Layout};
 use std::sync::Mutex;
@@ -41,7 +46,13 @@ struct TlsImageInfo {
 
 struct ThreadRec {
     teb: usize,
+    /// Thread id: TEB addresses are reused by the OS, so a matching TEB
+    /// pointer alone does not mean the record is the current thread's.
+    tid: u32,
     is_target: bool,
+    /// Pool threads are reused after a callback returns: keep ntdll's own
+    /// array for them. One-shot threads get it nulled on the way out.
+    reusable: bool,
     /// One block per entry of `TlsState::images`, same order.
     blocks: Vec<usize>,
     /// The ntdll-owned array this thread had before we replaced it; restored
@@ -195,25 +206,39 @@ pub fn initialize(images: &[Image]) -> Result<(), String> {
     });
     // The loader's main thread keeps running our code (join/exit paths), so
     // its Rust TLS must keep working: attach it, preserving slot 0.
-    attach_for_teb(sys::teb(), false)?;
+    attach_for_teb(sys::teb(), false, true)?;
     Ok(())
 }
 
 /// Attach the current thread for running target code: slot 0 becomes the
-/// target's block.
+/// target's block. The thread is expected to die right after (one-shot).
 pub fn attach_current_thread() -> Result<(), String> {
-    attach_for_teb(sys::teb(), true)
+    attach_for_teb(sys::teb(), true, false)
 }
 
-fn attach_for_teb(teb: usize, is_target: bool) -> Result<(), String> {
+/// Same, for thread-pool threads that keep running other work afterwards.
+pub fn attach_reusable_thread() -> Result<(), String> {
+    attach_for_teb(sys::teb(), true, true)
+}
+
+fn attach_for_teb(teb: usize, is_target: bool, reusable: bool) -> Result<(), String> {
     let mut guard = STATE.lock().unwrap();
     let Some(st) = guard.as_mut() else { return Ok(()) };
     maintain_locked(st)?;
-    if st.threads.iter().any(|t| t.teb == teb) {
-        return Ok(());
+    let tid = unsafe { sys::GetCurrentThreadId() };
+    if let Some(pos) = st.threads.iter().position(|t| t.teb == teb) {
+        if st.threads[pos].tid == tid {
+            return Ok(());
+        }
+        // TEB address reused by a new thread: drop the stale record.
+        st.threads.remove(pos);
     }
     let cur = sys::tls_array_for(teb);
-    let host: Vec<usize> = (0..st.base_slot).map(|i| unsafe { *cur.add(i) }).collect();
+    let host: Vec<usize> = if cur.is_null() {
+        vec![0; st.base_slot]
+    } else {
+        (0..st.base_slot).map(|i| unsafe { *cur.add(i) }).collect()
+    };
     let mut blocks = Vec::with_capacity(st.images.len());
     for si in &st.images {
         blocks.push(alloc_block(si)?);
@@ -230,12 +255,14 @@ fn attach_for_teb(teb: usize, is_target: bool) -> Result<(), String> {
     sys::set_tls_array_for(teb, ours as *mut usize);
     st.threads.push(ThreadRec {
         teb,
+        tid,
         is_target,
+        reusable,
         blocks,
         original: cur as usize,
         ours,
     });
-    vlog!("tls: thread {teb:#x} attached (target {is_target}, array {len} entries)");
+    vlog!("tls: thread {teb:#x} (tid {tid}) attached (target {is_target}, array {len} entries)");
     Ok(())
 }
 
@@ -248,18 +275,43 @@ pub fn restore_current_thread_array() {
         Ok(g) => g,
         Err(_) => return,
     };
-    let Some(st) = guard.as_mut() else { return };
-    let Some(pos) = st.threads.iter().position(|t| t.teb == teb) else {
+    let tid = unsafe { sys::GetCurrentThreadId() };
+    let Some(st) = guard.as_mut() else {
+        vlog!("tls: restore on thread {teb:#x} (tid {tid}) — TLS state absent");
         return;
     };
-    let rec = &st.threads[pos];
-    let (original, ours) = (rec.original, rec.ours);
+    let Some(pos) = st
+        .threads
+        .iter()
+        .position(|t| t.teb == teb && t.tid == tid)
+    else {
+        vlog!("tls: restore on untracked thread {teb:#x} (tid {tid}) — no-op");
+        return;
+    };
+    let (original, ours, reusable) = {
+        let rec = &st.threads[pos];
+        (rec.original, rec.ours, rec.reusable)
+    };
     if sys::tls_array_for(teb) as usize == ours {
-        sys::set_tls_array_for(teb, original as *mut usize);
-        vlog!("tls: thread {teb:#x} array restored for exit");
+        if reusable {
+            // Pool thread: it will run more work; give ntdll its array back.
+            sys::set_tls_array_for(teb, original as *mut usize);
+            vlog!("tls: thread {teb:#x} (tid {tid}) array restored for reuse");
+        } else {
+            // One-shot thread about to die: null the pointer so ntdll's
+            // thread teardown (LdrpFreeTls) skips all frees -- its private
+            // LdrpTlsHeap may only ever free ntdll's own allocations.
+            sys::set_tls_array_for(teb, std::ptr::null_mut());
+            vlog!("tls: thread {teb:#x} (tid {tid}) array nulled for exit");
+        }
+    } else {
+        // ntdll reallocated (a TLS module loaded); the TEB already points at
+        // ntdll's fresh array, keep it.
+        vlog!(
+            "tls: thread {teb:#x} (tid {tid}) restore skipped: TEB array {:#x} != ours {ours:#x}",
+            sys::tls_array_for(teb) as usize
+        );
     }
-    // else: ntdll reallocated (a TLS module loaded); the TEB already points
-    // at ntdll's fresh array, keep it.
     st.threads.remove(pos);
 }
 
@@ -310,6 +362,7 @@ fn migrate(st: &mut TlsState, new_count: usize) -> Result<(), String> {
         ..
     } = st;
     *base_slot = new_count;
+    threads.retain(|rec| unsafe { *((rec.teb + 0x48) as *const u32) == rec.tid });
     for rec in threads.iter_mut() {
         let cur = sys::tls_array_for(rec.teb);
         // ntdll reallocated each thread's array when the module loaded; the

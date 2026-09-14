@@ -38,6 +38,15 @@ unsafe extern "system" {
 
     pub fn GetSystemDirectoryW(lpBuffer: *mut u16, uSize: u32) -> u32;
     pub fn GetWindowsDirectoryW(lpBuffer: *mut u16, uSize: u32) -> u32;
+    pub fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: *mut c_void,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: Handle,
+    ) -> Handle;
     pub fn WideCharToMultiByte(
         CodePage: u32,
         dwFlags: u32,
@@ -61,6 +70,7 @@ unsafe extern "system" {
     pub fn GetExitCodeThread(hThread: Handle, lpExitCode: *mut u32) -> i32;
 
     pub fn GetLastError() -> u32;
+    pub fn GetCurrentThreadId() -> u32;
     pub fn GetStdHandle(nStdHandle: u32) -> Handle;
     pub fn WriteFile(
         hFile: Handle,
@@ -114,12 +124,43 @@ pub fn terminate_self(code: u32) -> ! {
 }
 
 /// Raw stderr write that must work on any thread, under any TLS state.
+/// With PELDR_LOG=<path> set, diagnostics go to that file instead, so the
+/// process stdio stays untouched (TUI targets check tty-ness).
+static LOG_HANDLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Call once from the main thread before running the target.
+pub fn init_logging() {
+    let Some(p) = std::env::var_os("PELDR_LOG") else { return };
+    let w = to_wide(&p.to_string_lossy());
+    let f = unsafe {
+        CreateFileW(
+            w.as_ptr(),
+            0x4,       // FILE_APPEND_DATA
+            0x1 | 0x2, // FILE_SHARE_READ | FILE_SHARE_WRITE
+            std::ptr::null_mut(),
+            0x4,       // OPEN_ALWAYS
+            0x80,      // FILE_ATTRIBUTE_NORMAL
+            std::ptr::null_mut(),
+        )
+    };
+    if f as isize != -1 {
+        LOG_HANDLE.store(f as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub fn raw_stderr(msg: &str) {
+    let mut written = 0u32;
+    let log = LOG_HANDLE.load(std::sync::atomic::Ordering::Relaxed);
+    if log != 0 {
+        unsafe {
+            WriteFile(log as Handle, msg.as_ptr(), msg.len() as u32, &mut written, std::ptr::null_mut());
+        }
+        return;
+    }
     let h = unsafe { GetStdHandle(0xFFFF_FFF4) }; // STD_ERROR_HANDLE
     if h.is_null() {
         return;
     }
-    let mut written = 0u32;
     unsafe {
         WriteFile(h, msg.as_ptr(), msg.len() as u32, &mut written, std::ptr::null_mut());
     }
