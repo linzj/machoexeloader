@@ -1,0 +1,263 @@
+//! PEB patching, command line construction and the jump to the target entry.
+
+use std::ffi::c_void;
+use std::path::Path;
+
+use crate::loader::Registry;
+use crate::sys;
+use crate::vlog;
+
+struct EntryStart {
+    entry: usize,
+}
+
+/// PEB offsets (x64).
+const PEB_IMAGE_BASE: usize = 0x10;
+const PEB_LDR: usize = 0x18;
+const PEB_PROCESS_PARAMS: usize = 0x20;
+const PARAMS_IMAGE_PATH_NAME: usize = 0x60;
+const PARAMS_COMMAND_LINE: usize = 0x70;
+const LDR_IN_LOAD_ORDER: usize = 0x10;
+const LDR_LINKS: usize = 0x0;
+const LDR_FULL_DLL_NAME: usize = 0x48;
+const LDR_BASE_DLL_NAME: usize = 0x58;
+
+pub fn run_target(reg: &Registry, argv: Vec<String>) -> ! {
+    let img = &reg.images[reg.main];
+    let pe = img.pe();
+    let entry = img.addr_of(pe.entry_rva);
+    let path = img.path.clone().expect("main image has a path");
+    let stack = (pe.stack_reserve as usize).max(8 * 1024 * 1024);
+
+    patch_peb(img.base, pe.size_of_image, &path, &argv);
+    crate::shim::set_target_path(&path);
+
+    vlog!(
+        "entry point {entry:#x}, stack reserve {stack:#x} (declared {:#x}/{:#x})",
+        pe.stack_reserve,
+        pe.stack_commit
+    );
+    install_crash_filter();
+    install_panic_hook();
+    crate::shim::patch_host_crt_command_line();
+    crate::shim::install_av_tracer();
+    let param = Box::into_raw(Box::new(EntryStart { entry })) as *mut c_void;
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+
+    let h = unsafe {
+        sys::CreateThread(
+            std::ptr::null_mut(),
+            stack,
+            Some(start_thread),
+            param,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if h.is_null() {
+        eprintln!("peldr: failed to create target thread ({})", unsafe { sys::GetLastError() });
+        std::process::exit(127);
+    }
+    unsafe {
+        sys::WaitForSingleObject(h, sys::INFINITE);
+    }
+    let mut code = 127u32;
+    unsafe {
+        sys::GetExitCodeThread(h, &mut code);
+    }
+    // Only reached when the target thread returned from the entry point
+    // without calling ExitProcess; CRT-based targets exit() instead.
+    sys::terminate_self(code);
+}
+
+unsafe extern "system" fn start_thread(p: *mut c_void) -> u32 {
+    let es = unsafe { Box::from_raw(p as *mut EntryStart) };
+    if let Err(e) = crate::tls::attach_current_thread() {
+        crate::rerr!("TLS setup failed on target thread: {e}");
+        return 127;
+    }
+    crate::tls::run_callbacks();
+    vlog!("jumping to target entry {:#x}", es.entry);
+    let f: unsafe extern "system" fn() -> i32 = unsafe { std::mem::transmute(es.entry) };
+    let ret = unsafe { f() };
+    crate::tls::restore_current_thread_array();
+    vlog!("target entry returned {ret}");
+    ret as u32
+}
+
+/// The loader's own std panic machinery touches Rust TLS, which target
+/// threads have re-pointed at the target's block; report panics with a raw
+/// WriteFile so the real message is never lost to a double panic.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("peldr: RUST PANIC: {info}\n");
+        crate::sys::raw_stderr(&msg);
+    }));
+}
+
+/// Diagnostic fallback for crashes in target code: report the faulting
+/// address and which mapped image (if any) it belongs to.
+fn install_crash_filter() {
+    unsafe {
+        sys::SetUnhandledExceptionFilter(Some(crash_filter));
+    }
+}
+
+unsafe extern "system" fn crash_filter(info: *mut sys::ExceptionPointers) -> i32 {
+    unsafe {
+        let er = (*info).exception_record;
+        let code = (*er).exception_code;
+        let addr = (*er).exception_address as usize;
+        let rip = if !(*info).context_record.is_null() {
+            let ctx = (*info).context_record as *const u8;
+            *(ctx.add(0xF8) as *const usize) // CONTEXT.Rip (x64)
+        } else {
+            addr
+        };
+        let mut out = format!(
+            "peldr: FATAL: unhandled exception {code:#010x} at {addr:#x} (rip {rip:#x})\n"
+        );
+        let view = crate::shim::view_if_installed();
+        if let Some(v) = view {
+            if let Ok(images) = v.images.lock() {
+                for im in images.iter() {
+                    if rip >= im.base && rip < im.base + im.size as usize {
+                        out.push_str(&format!(
+                            "peldr:   faulting in {} at +{:#x} (base {:#x})\n",
+                            im.name,
+                            rip - im.base,
+                            im.base
+                        ));
+                    }
+                }
+            }
+        }
+        let params = (*er).number_parameters as usize;
+        for i in 0..params.min(15) {
+            out.push_str(&format!("peldr:   param[{i}] = {:#x}\n", (*er).exception_information[i]));
+        }
+        sys::raw_stderr(&out);
+    }
+    sys::terminate_self(127)
+}
+
+fn patch_peb(base: usize, size_of_image: u32, path: &Path, argv: &[String]) {
+    let full = path.display().to_string();
+    let file = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| full.clone());
+    let cmd = build_command_line(argv);
+
+    let full_w = leak_wide(&sys::to_wide(&full));
+    let file_w = leak_wide(&sys::to_wide(&file));
+    let (cmd_ptr, cmd_len) = crate::shim::set_command_line(&cmd);
+
+    unsafe {
+        let peb = sys::peb();
+        if crate::diag::verbose() {
+            let p = *((peb + PEB_PROCESS_PARAMS) as *const usize);
+            let us = |at: usize| -> String {
+                let len = *(at as *const u16) as usize;
+                let buf = *((at + 8) as *const *const u16);
+                if buf.is_null() || len == 0 || len > 4096 {
+                    format!("(len {len})")
+                } else {
+                    String::from_utf16_lossy(std::slice::from_raw_parts(buf, len / 2))
+                }
+            };
+            vlog!("peb: old ImagePathName = {}", us(p + PARAMS_IMAGE_PATH_NAME));
+            vlog!("peb: old CommandLine   = {}", us(p + PARAMS_COMMAND_LINE));
+        }
+        // The target thinks it is the process image.
+        *((peb + PEB_IMAGE_BASE) as *mut usize) = base;
+        let params = *((peb + PEB_PROCESS_PARAMS) as *const usize);
+        write_unicode_string(params + PARAMS_COMMAND_LINE, cmd_ptr, cmd_len);
+        write_unicode_string(params + PARAMS_IMAGE_PATH_NAME, full_w.ptr, full_w.byte_len);
+        if crate::diag::verbose() {
+            vlog!("peb: new CommandLine   = {cmd:?}");
+        }
+        // Main module LDR entry names (GetModuleFileNameW(NULL) et al.).
+        let ldr = *((peb + PEB_LDR) as *const usize);
+        if ldr != 0 {
+            let head = ldr + LDR_IN_LOAD_ORDER;
+            let first = *(head as *const usize);
+            if first != head && first != 0 {
+                let _ = LDR_LINKS;
+                write_unicode_string(first + LDR_FULL_DLL_NAME, full_w.ptr, full_w.byte_len);
+                write_unicode_string(first + LDR_BASE_DLL_NAME, file_w.ptr, file_w.byte_len);
+            }
+        }
+    }
+    vlog!("peb patched: image base {base:#x}, size {size_of_image:#x}, argv0 {:?}", argv.first());
+}
+
+/// (buffer pointer, byte length without NUL)
+struct Wide {
+    ptr: *mut u16,
+    byte_len: u16,
+}
+
+fn leak_wide(w: &[u16]) -> Wide {
+    let byte_len = (w.len().saturating_sub(1) * 2) as u16;
+    let b = w.to_vec().into_boxed_slice();
+    Wide {
+        ptr: Box::into_raw(b) as *mut u16,
+        byte_len,
+    }
+}
+
+unsafe fn write_unicode_string(at: usize, buf: *mut u16, byte_len: u16) {
+    unsafe {
+        *(at as *mut u16) = byte_len;
+        *((at + 2) as *mut u16) = byte_len + 2;
+        *((at + 8) as *mut usize) = buf as usize;
+    }
+}
+
+/// CommandLineToArgvW-compatible quoting.
+pub fn quote_arg(s: &str) -> String {
+    if !s.is_empty() && !s.contains([' ', '\t', '"']) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in s.chars() {
+        match c {
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
+            '"' => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push('\\');
+                out.push('"');
+            }
+            _ => {
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+fn build_command_line(argv: &[String]) -> String {
+    let mut parts = Vec::with_capacity(argv.len());
+    for a in argv {
+        parts.push(quote_arg(a));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    parts.join(" ")
+}

@@ -1,3 +1,7 @@
 /target
 /tests/out
 /tmp
+/peldr/target
+/peldr/tests/out
+/peldr/tmp
+/peldr/*.obj
