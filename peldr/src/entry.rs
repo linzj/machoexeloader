@@ -41,6 +41,7 @@ pub fn run_target(reg: &Registry, argv: Vec<String>) -> ! {
     install_panic_hook();
     crate::shim::patch_host_crt_command_line();
     crate::shim::install_av_tracer();
+    start_input_probe();
     let param = Box::into_raw(Box::new(EntryStart { entry })) as *mut c_void;
     std::io::Write::flush(&mut std::io::stdout()).ok();
     std::io::Write::flush(&mut std::io::stderr()).ok();
@@ -84,6 +85,45 @@ unsafe extern "system" fn start_thread(p: *mut c_void) -> u32 {
     crate::tls::restore_current_thread_array();
     vlog!("target entry returned {ret}");
     ret as u32
+}
+
+/// Verbose-only: report the stdin handle's nature and pending console input
+/// count every couple of seconds, so a "keys do nothing" report can be
+/// split into "input never reaches the console" vs "wait/callback broken".
+extern "system" fn input_probe_thread(_param: *mut c_void) -> u32 {
+    // A raw thread: Rust std threads are unsafe here because the loader's
+    // `_tls_index` was moved to slot C, so extend this thread's TLS first.
+    if let Err(e) = crate::tls::extend_current_loader_thread() {
+        crate::rerr!("input probe TLS setup failed: {e}");
+    }
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+    let h = unsafe { sys::GetStdHandle(STD_INPUT_HANDLE) };
+    let mut mode = 0u32;
+    let cm = unsafe { sys::GetConsoleMode(h, &mut mode) };
+    let ft = unsafe { sys::GetFileType(h) };
+    vlog!("input probe: stdin {h:p} consolemode ok={cm} mode={mode:#x} filetype={ft}");
+    loop {
+        let mut n = 0u32;
+        let ok = unsafe { sys::GetNumberOfConsoleInputEvents(h, &mut n) };
+        vlog!("input probe: pending events ok={ok} n={n}");
+        unsafe { sys::Sleep(2000) };
+    }
+}
+
+fn start_input_probe() {
+    if !crate::diag::verbose() {
+        return;
+    }
+    unsafe {
+        sys::CreateThread(
+            std::ptr::null_mut(),
+            0,
+            Some(input_probe_thread),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+        );
+    }
 }
 
 /// The loader's own std panic machinery touches Rust TLS, which target

@@ -221,6 +221,12 @@ pub fn attach_reusable_thread() -> Result<(), String> {
     attach_for_teb(sys::teb(), true, true)
 }
 
+/// Loader-side helper thread (not running target code): extend its array so
+/// the loader's own Rust TLS (index moved to slot C) keeps working there.
+pub fn extend_current_loader_thread() -> Result<(), String> {
+    attach_for_teb(sys::teb(), false, true)
+}
+
 fn attach_for_teb(teb: usize, is_target: bool, reusable: bool) -> Result<(), String> {
     let mut guard = STATE.lock().unwrap();
     let Some(st) = guard.as_mut() else { return Ok(()) };
