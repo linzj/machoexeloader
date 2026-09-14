@@ -67,7 +67,8 @@ peldr [-v] [-e] [-r] <目标> [args...]
 | `GetCommandLineA/W` | 返回伪造的命令行(宿主 kernelbase 按首调缓存,必须自供) |
 | `CreateThread`、`_beginthreadex` | 包装 start routine:新线程先完成 TLS 数组重建 |
 | `RegisterWaitForSingleObject` | 回调跑在 ntdll 线程池线程上(不经 CreateThread),同样先重建 TLS,回调结束归还数组(Bun 的控制台输入读取走这条路) |
-| `ExitProcess`、`ExitThread`、`TerminateProcess`(自身) | 先还原 ntdll TLS 数组 / 硬退出 |
+| `ExitProcess`、`ExitThread`、`TerminateProcess`(自身) | 进程级硬退出(目标 atexit 已跑完)/ 线程退出前处理 TEB TLS 数组 |
+| `RtlExitUserThread`、`RtlExitUserProcess`、`FreeLibraryAndExitThread` | ntdll 的退出入口,含 Bun 经 `GetProcAddress` 动态解析后直接调用的 `RtlExitUserThread`(由 GetProcAddress shim 拦截);退出前把 TEB TLS 数组置空或还原 |
 
 诊断开关(环境变量,均为只读观测):`PELDR_TRACE_AV=1`(首次异常:寄存器+指令字节+栈转储+镜像内定位)、
 `PELDR_TRACE_EXIT=1`(exit/_exit/_amsg_exit 调用点及返回地址)、`PELDR_TRACE_SOCK=1`(WSAStartup/GetHostNameW)。
@@ -101,10 +102,16 @@ peldr [-v] [-e] [-r] <目标> [args...]
   直读 argv(绝不调 API)、目标 IAT 注入 GetCommandLine* shim、宿主 msvcrt/ucrtbase
   的 IAT 与 `_acmdln`/`_wcmdln` 导出数据一起改写(经 msvcrt 内部路径的 `__wgetmainargs`
   由此修好)。
-- **ntdll 线程拆卸按自己的记账释放 TLS 块与数组**:换过数组的线程必须在退出前
-  (以及进程退出前)把 TEB 指针换回 ntdll 原始数组,否则它在自家堆上释放陌生指针。
-  进程级 ExitProcess 的 detach 阶段还会放大竞态,加载器对目标的 ExitProcess 直接
-  走 `TerminateProcess(GetCurrentProcess())`(目标的 atexit 已在其 exit() 路径跑完,
+- **TLS 数组与块都来自 ntdll 的私有堆,线程拆卸只认自家记账**:`LdrpFreeTls`
+  (线程拆卸)用私有 `LdrpTlsHeap` 释放 `TEB->TlsArray` 及其中每个模块的 TLS 块——
+  手工映射线程的数组/块属于进程堆,让它按自家记账释放即堆损坏(表现为启动 ~25 秒
+  后的静默 fail-fast;TUI 停在最后一帧,看起来就像"卡死、无法输入")。方案:
+  一次性线程(CreateThread 包装的)退出前把 `TEB->TlsArray` 置空——拆卸直接跳过
+  全部释放(每线程泄漏几十字节);会被复用的池线程(RegisterWait 回调)在回调结束
+  后换回 ntdll 原数组。TEB 地址会被系统复用,线程记录按 (TEB, tid) 双键校验。
+  Bun 经 `GetProcAddress` 动态解析并直接调用 `ntdll!RtlExitUserThread` 的路径由
+  GetProcAddress shim 拦截。进程级退出沿用硬退出
+  (`TerminateProcess(GetCurrentProcess())`,目标 atexit 已在其 exit() 路径跑完,
   输出已冲刷,退出码不变)。
 - **延迟加载辅助器用 `LoadLibraryExA/W`**(不是 LoadLibraryA/W),对应 shim 缺一不可。
 - **`.pdata` 必须 RtlAddFunctionTable**(78,997 条实测);JSC/Bun 的 VEH 走 kernel32

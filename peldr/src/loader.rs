@@ -117,6 +117,7 @@ pub fn load(target: &str, extra_dirs: &[String], force_rebase: bool) -> Result<R
     reg.by_path.insert(path.clone(), 0);
     reg.by_name.insert(name, 0);
 
+    sys::init_logging();
     crate::shim::init_reals();
     load_deps(&mut reg, 0, extra_dirs, force_rebase)?;
 
