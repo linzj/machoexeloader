@@ -79,6 +79,7 @@ unsafe extern "system" fn start_thread(p: *mut c_void) -> u32 {
         return 127;
     }
     crate::tls::run_callbacks();
+    crate::tls::run_thread_attach_callbacks();
     vlog!("jumping to target entry {:#x}", es.entry);
     let f: unsafe extern "system" fn() -> i32 = unsafe { std::mem::transmute(es.entry) };
     let ret = unsafe { f() };

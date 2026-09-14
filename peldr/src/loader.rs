@@ -18,6 +18,48 @@ pub struct Registry {
     pub main: usize,
 }
 
+/// Preload the GUI/COM stack (best effort) BEFORE any target thread exists.
+/// A TLS-bearing host DLL loaded later runs ntdll's per-thread TLS vector
+/// upgrade on threads whose TEB points at OUR array; ntdll then frees the
+/// "old vector" from its private LdrpTlsHeap -- a foreign pointer -> heap
+/// fail-fast (0xC0000374). Loading the usual lazily-pulled DLLs up front
+/// keeps the host TLS-module count stable for the whole run.
+fn preload_host_gui_stack() {
+    const DLLS: &[&str] = &[
+        "user32.dll",
+        "gdi32.dll",
+        "gdi32full.dll",
+        "imm32.dll",
+        "msctf.dll",
+        "uxtheme.dll",
+        "comctl32.dll",
+        "ole32.dll",
+        "combase.dll",
+        "shcore.dll",
+        "winmm.dll",
+        "dwrite.dll",
+        "d2d1.dll",
+        "dxgi.dll",
+        "d3d11.dll",
+        "propsys.dll",
+        "windows.storage.dll",
+        "shlwapi.dll",
+        "msutb.dll",
+        "textinputframework.dll",
+        // Not on the default search path: msctf pulls it in by full path on
+        // first window/TSF use, and its late load is what triggers ntdll's
+        // per-thread TLS vector upgrade on a thread we patched.
+        "C:\\Program Files\\Common Files\\microsoft shared\\ink\\tiptsf.dll",
+    ];
+    let mut n = 0usize;
+    for d in DLLS {
+        if crate::sys::load_library_a(d).is_ok() {
+            n += 1;
+        }
+    }
+    vlog!("preloaded {n}/{} host GUI/COM dlls", DLLS.len());
+}
+
 pub fn run_program(
     target: &str,
     argv: Vec<String>,
@@ -119,6 +161,7 @@ pub fn load(target: &str, extra_dirs: &[String], force_rebase: bool) -> Result<R
 
     sys::init_logging();
     crate::shim::init_reals();
+    preload_host_gui_stack();
     load_deps(&mut reg, 0, extra_dirs, force_rebase)?;
 
     let mut bound = 0usize;
