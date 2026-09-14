@@ -5,3 +5,6 @@
 /peldr/tests/out
 /peldr/tmp
 /peldr/*.obj
+/elldr/target
+/elldr/tests/out
+/elldr/tmp

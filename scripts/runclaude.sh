@@ -2,6 +2,7 @@
 # 经用户态加载器启动 claude 原生二进制:
 #   macOS  -> mldr  (darwin-arm64)
 #   Windows Git Bash -> peldr (win32-x64)
+#   Linux  -> elldr (linux-x64)
 # 环境/flags 对齐 ~/.local/bin/claude-node:
 #   DISABLE_AUTOUPDATER=1、本机代理、--setting-sources project,local
 #   (排除 user settings,注入的钩子都挂在 user settings 里)、
@@ -53,22 +54,44 @@ case "$(uname -s)" in
     LOADER_NAME=peldr.exe
     BUILD_HINT="cargo build --release(在 peldr/ 目录)"
     ;;
+  Linux)
+    case "$(uname -m)" in
+      x86_64|AMD64) ;;
+      *) echo "elldr 目前仅支持 x64: $(uname -m)" >&2; exit 1 ;;
+    esac
+    PLATFORM=linux-x64
+    BIN=claude
+    CLAUDE=$HOME/.local/bin/claude
+    LOADER_REL=elldr/target/release/elldr
+    LOADER_NAME=elldr
+    BUILD_HINT="cargo build --release(在 elldr/ 目录)"
+    ;;
   *)
-    echo "不支持的平台: $(uname -s)(本脚本支持 macOS/mldr 与 Windows Git Bash/peldr)" >&2
+    echo "不支持的平台: $(uname -s)(本脚本支持 macOS/mldr、Windows Git Bash/peldr 与 Linux/elldr)" >&2
     exit 1
     ;;
 esac
 
 # ---- 定位加载器: RUNCLAUDE_LOADER > 脚本所在仓库 ------------------------------
-# 排查用: RUNCLAUDE_VERBOSE=1 让加载器带 -v 输出;未显式指定 PELDR_LOG 时
-# 日志默认落 $HOME/peldr.log(避免污染 TUI)
+# 排查用: RUNCLAUDE_VERBOSE=1 让加载器带 -v 输出;未显式指定日志变量时
+# 日志默认落 $HOME/elldr.log(elldr)或 $HOME/peldr.log(peldr),避免污染 TUI
 LOADER_FLAGS=
 if [ -n "${RUNCLAUDE_VERBOSE:-}" ]; then
   LOADER_FLAGS=-v
-  if [ -z "${PELDR_LOG:-}" ]; then
-    PELDR_LOG=$HOME/peldr.log
-    export PELDR_LOG
-  fi
+  case "$PLATFORM" in
+    linux-x64)
+      if [ -z "${ELLDR_LOG:-}" ]; then
+        ELLDR_LOG=$HOME/elldr.log
+        export ELLDR_LOG
+      fi
+      ;;
+    *)
+      if [ -z "${PELDR_LOG:-}" ]; then
+        PELDR_LOG=$HOME/peldr.log
+        export PELDR_LOG
+      fi
+      ;;
+  esac
 fi
 LOADER=
 for cand in "${RUNCLAUDE_LOADER:-}" "$ROOT/$LOADER_REL"; do
@@ -88,7 +111,14 @@ STATUSLINE=$HOME/.claude/statusline-command.sh
 BASE_URL=https://downloads.claude.ai/claude-code-releases
 
 export DISABLE_AUTOUPDATER=1
-export https_proxy=http://127.0.0.1:7899 http_proxy=http://127.0.0.1:7899
+# 本机代理:Windows/macOS 与普通 Linux 在回环;WSL2 下代理在 Windows 宿主机,
+# 127.0.0.1 指向 WSL 自身会 ECONNREFUSED,需走默认网关(同 ~/updatenpmpackages.sh)
+PROXY_HOST=127.0.0.1
+if [ "$PLATFORM" = linux-x64 ] && grep -qi microsoft /proc/version 2>/dev/null; then
+  PROXY_HOST=$(ip route show default | awk '{print $3; exit}')
+  [ -n "$PROXY_HOST" ] || PROXY_HOST=127.0.0.1
+fi
+export https_proxy=http://$PROXY_HOST:7899 http_proxy=http://$PROXY_HOST:7899
 export HTTPS_PROXY=$https_proxy HTTP_PROXY=$http_proxy
 
 sha256() {
@@ -180,6 +210,13 @@ do_install() {
   if [ "$PLATFORM" = darwin-arm64 ]; then
     echo "==> 经加载器执行 install..."
     "$LOADER" "$bin" install || { echo "install 失败"; return 1; }
+  elif [ "$PLATFORM" = linux-x64 ] && [ -d "$HOME/.local/share/claude/versions" ]; then
+    # 官方 Linux 布局: 版本文件落 versions/ 目录,bin 为符号链接
+    echo "==> 安装到 $HOME/.local/share/claude/versions/$version ..."
+    vdir=$HOME/.local/share/claude/versions
+    cp -f "$bin" "$vdir/$version" || { echo "复制失败"; return 1; }
+    chmod +x "$vdir/$version"
+    ln -sfn "$vdir/$version" "$CLAUDE"
   else
     echo "==> 安装到 $CLAUDE ..."
     mkdir -p "$(dirname "$CLAUDE")"
