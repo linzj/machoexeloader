@@ -62,6 +62,7 @@ static REAL_UNREGISTER_WAIT: AtomicUsize = AtomicUsize::new(0);
 static REAL_UNREGISTER_WAIT_EX: AtomicUsize = AtomicUsize::new(0);
 static REAL_READ_CONSOLE_INPUT_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_NT_CREATE_THREAD_EX: AtomicUsize = AtomicUsize::new(0);
+static REAL_POST_QUEUED: AtomicUsize = AtomicUsize::new(0);
 static REAL_RTL_EXIT_USER_THREAD: AtomicUsize = AtomicUsize::new(0);
 static REAL_RTL_EXIT_USER_PROCESS: AtomicUsize = AtomicUsize::new(0);
 static REAL_FREE_LIBRARY_AND_EXIT_THREAD: AtomicUsize = AtomicUsize::new(0);
@@ -98,6 +99,7 @@ pub fn init_reals() {
     set(&REAL_UNREGISTER_WAIT, "UnregisterWait");
     set(&REAL_UNREGISTER_WAIT_EX, "UnregisterWaitEx");
     set(&REAL_READ_CONSOLE_INPUT_W, "ReadConsoleInputW");
+    set(&REAL_POST_QUEUED, "PostQueuedCompletionStatus");
     if let Some(p) = sys::ntdll_proc("NtCreateThreadEx") {
         REAL_NT_CREATE_THREAD_EX.store(p, Ordering::Relaxed);
     }
@@ -693,6 +695,12 @@ unsafe extern "system" fn waiter_bootstrap(param: *mut c_void, fired: u8) {
     if let Err(e) = crate::tls::attach_reusable_thread() {
         crate::rerr!("TLS setup failed on pool thread: {e}");
     }
+    // Native semantics: the thread's per-module TLS state was initialized by
+    // the images' TLS callbacks (DLL_THREAD_ATTACH) at thread start. The pool
+    // thread never ran them for the target, so its freshly attached block
+    // holds only raw template bytes -- run them before the callback like a
+    // real thread creation would have.
+    crate::tls::run_thread_attach_callbacks();
     let f: unsafe extern "system" fn(*mut c_void, u8) = unsafe { std::mem::transmute(ws.cb) };
     unsafe { f(ws.ctx, fired) };
     vlog!("shim: waiter tail (tid {}) callback done", unsafe { sys::GetCurrentThreadId() });
@@ -712,6 +720,12 @@ extern "system" fn shim_register_wait(
     if callback == 0 {
         let rc = unsafe { f(new_wait, object, 0, context, milliseconds, flags) };
         vlog!("shim: RegisterWaitForSingleObject(object {object:p}, cb null) -> {rc}");
+        return rc;
+    }
+    if std::env::var_os("PELDR_NOWRAP").is_some() {
+        // Diagnostic: register the target callback directly (no TLS wrap).
+        let rc = unsafe { f(new_wait, object, callback, context, milliseconds, flags) };
+        vlog!("shim: RegisterWaitForSingleObject(object {object:p}, cb {callback:#x}) -> {rc} [direct]");
         return rc;
     }
     let ws = Box::into_raw(Box::new(WaitStart {
@@ -772,6 +786,22 @@ extern "system" fn shim_read_console_input_w(
             unsafe { sys::GetCurrentThreadId() }
         );
     }
+    rc
+}
+
+extern "system" fn shim_post_queued_completion(
+    port: Handle,
+    bytes: u32,
+    key: usize,
+    overlapped: *mut c_void,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, u32, usize, *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(REAL_POST_QUEUED.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(port, bytes, key, overlapped) };
+    vlog!(
+        "shim: PostQueuedCompletionStatus(port {port:p}, key {key:#x}) -> {rc} tid {}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
     rc
 }
 
@@ -1362,6 +1392,9 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
             }
             "ReadConsoleInputW" if have(&REAL_READ_CONSOLE_INPUT_W) => {
                 cast(shim_read_console_input_w as *const ())
+            }
+            "PostQueuedCompletionStatus" if have(&REAL_POST_QUEUED) => {
+                cast(shim_post_queued_completion as *const ())
             }
             "ExitProcess" if have(&REAL_EXIT_PROCESS) => cast(shim_exit_process as *const ()),
             "ExitThread" if have(&REAL_EXIT_THREAD) => cast(shim_exit_thread as *const ()),
