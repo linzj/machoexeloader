@@ -60,9 +60,16 @@ case "$(uname -s)" in
 esac
 
 # ---- 定位加载器: RUNCLAUDE_LOADER > 脚本所在仓库 ------------------------------
-# 排查用: RUNCLAUDE_VERBOSE=1 让加载器带 -v 输出(配合 PELDR_LOG=<文件> 落盘)
+# 排查用: RUNCLAUDE_VERBOSE=1 让加载器带 -v 输出;未显式指定 PELDR_LOG 时
+# 日志默认落 $HOME/peldr.log(避免污染 TUI)
 LOADER_FLAGS=
-[ -n "${RUNCLAUDE_VERBOSE:-}" ] && LOADER_FLAGS=-v
+if [ -n "${RUNCLAUDE_VERBOSE:-}" ]; then
+  LOADER_FLAGS=-v
+  if [ -z "${PELDR_LOG:-}" ]; then
+    PELDR_LOG=$HOME/peldr.log
+    export PELDR_LOG
+  fi
+fi
 LOADER=
 for cand in "${RUNCLAUDE_LOADER:-}" "$ROOT/$LOADER_REL"; do
   if [ -n "$cand" ] && [ -f "$cand" ]; then
