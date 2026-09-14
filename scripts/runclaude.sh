@@ -60,6 +60,9 @@ case "$(uname -s)" in
 esac
 
 # ---- 定位加载器: RUNCLAUDE_LOADER > 脚本所在仓库 ------------------------------
+# 排查用: RUNCLAUDE_VERBOSE=1 让加载器带 -v 输出(配合 PELDR_LOG=<文件> 落盘)
+LOADER_FLAGS=
+[ -n "${RUNCLAUDE_VERBOSE:-}" ] && LOADER_FLAGS=-v
 LOADER=
 for cand in "${RUNCLAUDE_LOADER:-}" "$ROOT/$LOADER_REL"; do
   if [ -n "$cand" ] && [ -f "$cand" ]; then
@@ -218,7 +221,7 @@ if [ -n "$hook_summary" ]; then
   fi
 fi
 
-exec "$LOADER" "$CLAUDE" \
+exec "$LOADER" $LOADER_FLAGS "$CLAUDE" \
   --settings "$settings_arg" \
   --setting-sources project,local \
   --dangerously-skip-permissions "$@"
