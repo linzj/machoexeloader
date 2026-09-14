@@ -27,6 +27,7 @@ cc() { MSYS_NO_PATHCONV=1 "$CL" /nologo /Od "$@" 2>&1; }
     cc ../targets/ctor.c || exit 1
     cc ../targets/tls.c || exit 1
     cc ../targets/threads.c || exit 1
+    cc ../targets/waiter.c || exit 1
     cc ../targets/modname.c || exit 1
     cc -LD ../targets/suffix.c || exit 1
     cc -LD ../targets/greet.c suffix.lib || exit 1
@@ -71,6 +72,7 @@ run_case exitcode 0
 run_case ctor
 run_case tls
 run_case threads
+run_case waiter
 run_case modname
 run_case greettest
 run_case greettest_delay
