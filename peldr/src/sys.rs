@@ -72,6 +72,10 @@ unsafe extern "system" {
     pub fn GetLastError() -> u32;
     pub fn GetCurrentThreadId() -> u32;
     pub fn GetStdHandle(nStdHandle: u32) -> Handle;
+    pub fn GetConsoleMode(hConsoleHandle: Handle, lpMode: *mut u32) -> i32;
+    pub fn GetFileType(hFile: Handle) -> u32;
+    pub fn GetNumberOfConsoleInputEvents(hConsoleInput: Handle, lpcNumberOfEvents: *mut u32) -> i32;
+    pub fn Sleep(dwMilliseconds: u32);
     pub fn WriteFile(
         hFile: Handle,
         lpBuffer: *const u8,
