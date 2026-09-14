@@ -87,6 +87,16 @@ mldr [-v] [-e] <目标> [args...]
   二进制在本环境会被拦截,mldr 下不受影响;需要网络的操作再挂
   `HTTPS_PROXY=http://127.0.0.1:7899`)
 
+`claude-*` 两项测试依赖 Claude Code 的原生二进制,仓库不含该文件(`tmp/` 已忽略),
+缺失时脚本自动跳过。要跑这两项,先把它下载到脚本预期位置:
+
+```
+npm install --prefix tmp/claude-code @anthropic-ai/claude-code@2.1.270
+# 二进制:tmp/claude-code/node_modules/@anthropic-ai/claude-code-darwin-arm64/claude
+```
+
+版本不敏感(任意 arm64 版本均可),测试只断言 `--version` 输出包含 `Claude Code`。
+
 也可手工对照:`mldr -v <target>` 的输出与 `otool -l`、`dyld_info -fixups` 交叉核对。
 
 ## 已知限制
