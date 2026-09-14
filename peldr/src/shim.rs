@@ -684,6 +684,9 @@ extern "system" fn shim_register_wait(
 ) -> i32 {
     let f: unsafe extern "system" fn(*mut Handle, Handle, usize, *mut c_void, u32, u32) -> i32 =
         unsafe { std::mem::transmute(REAL_REGISTER_WAIT.load(Ordering::Relaxed)) };
+    vlog!(
+        "shim: RegisterWaitForSingleObject(object {object:p}, cb {callback:#x}, flags {flags:#x}, ms {milliseconds})"
+    );
     if callback == 0 {
         return unsafe { f(new_wait, object, 0, context, milliseconds, flags) };
     }
