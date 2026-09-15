@@ -46,6 +46,40 @@ pub fn run_target(reg: &Registry, argv: Vec<String>) -> ! {
     std::io::Write::flush(&mut std::io::stdout()).ok();
     std::io::Write::flush(&mut std::io::stderr()).ok();
 
+    // Diagnostic: shift the phase between the app's startup timers and the
+    // console's input-batch delivery.
+    if let Some(ms) = std::env::var_os("PELDR_ENTRY_DELAY_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u32>() {
+            vlog!("entry delay: sleeping {ms} ms before creating the target thread");
+            unsafe { sys::Sleep(ms) };
+        }
+    }
+
+    // Diagnostic: run the target entry on the loader's PRIMARY thread via a
+    // fiber (18MB fiber stack), so the app's "main" thread identity matches
+    // a real process.
+    if std::env::var_os("PELDR_PRIMARY_FIBER").is_some() {
+        vlog!("primary-fiber mode: running entry on the primary thread");
+        let param = Box::into_raw(Box::new(EntryStart { entry })) as *mut c_void;
+        let fiber = unsafe { sys::CreateFiber(stack, Some(fiber_start), param) };
+        vlog!("primary-fiber: CreateFiber -> {fiber:p} (gle {})", unsafe { sys::GetLastError() });
+        if fiber.is_null() {
+            eprintln!("peldr: failed to create fiber ({})", unsafe { sys::GetLastError() });
+            std::process::exit(127);
+        }
+        let converted = unsafe { sys::ConvertThreadToFiber(std::ptr::null_mut()) };
+        vlog!("primary-fiber: ConvertThreadToFiber -> {converted:p} (gle {})", unsafe { sys::GetLastError() });
+        if converted.is_null() {
+            eprintln!("peldr: ConvertThreadToFiber failed ({})", unsafe { sys::GetLastError() });
+            std::process::exit(127);
+        }
+        vlog!("primary-fiber: switching");
+        unsafe { sys::SwitchToFiber(fiber) };
+        vlog!("primary-fiber: returned from fiber");
+        // Returned from the fiber without exiting the process.
+        std::process::exit(127);
+    }
+
     let h = unsafe {
         sys::CreateThread(
             std::ptr::null_mut(),
@@ -95,6 +129,34 @@ unsafe extern "system" fn start_thread(p: *mut c_void) -> u32 {
     ret as u32
 }
 
+unsafe extern "system" fn fiber_start(p: *mut c_void) -> ! {
+    crate::rerr!("primary-fiber: fiber_start entered");
+    if let Some(ms) = std::env::var_os("PELDR_FIBER_PAUSE_MS") {
+        if let Ok(ms) = ms.to_string_lossy().parse::<u32>() {
+            crate::rerr!("primary-fiber: pausing {ms} ms before callbacks (attach now)");
+            unsafe { sys::Sleep(ms) };
+        }
+    }
+    let es = unsafe { Box::from_raw(p as *mut EntryStart) };
+    // The primary thread was pre-attached by tls::initialize() as a loader
+    // thread (is_target=false, array[0] = host block). Peel that record off
+    // so attach_current_thread does a full target-layout attach.
+    crate::tls::restore_current_thread_array();
+    if let Err(e) = crate::tls::attach_current_thread() {
+        crate::rerr!("TLS setup failed on primary-fiber thread: {e}");
+        sys::terminate_self(127);
+    }
+    crate::rerr!("primary-fiber: tls attached");
+    crate::tls::run_callbacks();
+    crate::tls::run_thread_attach_callbacks();
+    vlog!("jumping to target entry {:#x} (primary fiber)", es.entry);
+    let f: unsafe extern "system" fn() -> i32 = unsafe { std::mem::transmute(es.entry) };
+    let ret = unsafe { f() };
+    crate::tls::restore_current_thread_array();
+    vlog!("target entry returned {ret} (primary fiber)");
+    sys::terminate_self(ret as u32)
+}
+
 /// Verbose-only watchdog: report the stdin handle's nature and pending console
 /// input count every couple of seconds, plus the shim event counters and the
 /// tracked-thread inventory every 10 seconds. A "keys do nothing" report can
@@ -120,6 +182,20 @@ extern "system" fn input_probe_thread(_param: *mut c_void) -> u32 {
         let mut n = 0u32;
         let ok = unsafe { sys::GetNumberOfConsoleInputEvents(h, &mut n) };
         vlog!("input probe: pending events ok={ok} n={n}");
+        let ctx0 = crate::shim::CONSOLE_WAIT_CTX.load(std::sync::atomic::Ordering::Relaxed);
+        let tty = if ctx0 != 0 { read_u64(ctx0).unwrap_or(0) } else { 0 };
+        if tty != 0 {
+            // G+0x58 flags, G+0x118 state, G+0x130 wait handle,
+            // G+0x120/0x128: dispatch selector (0 => raw path) + buffer ptr
+            let flags = read_u64(tty + 0x58).map(|v| v as u32).unwrap_or(0);
+            let state = read_u64(tty + 0x118).map(|v| v as u32).unwrap_or(0);
+            let wh = read_u64(tty + 0x130).unwrap_or(0);
+            let sel = read_u64(tty + 0x120).map(|v| v as u32).unwrap_or(0);
+            let buf = read_u64(tty + 0x128).unwrap_or(0);
+            vlog!(
+                "console state: flags={flags:#010x} state={state:#x} wait={wh:#x} sel={sel:#x} buf={buf:#x}"
+            );
+        }
         // Freeze detection: console events are waiting, but the target has
         // not read any for ~12s. Dump the console-driver state once.
         let reads = crate::diag::CON_READS.load(std::sync::atomic::Ordering::Relaxed);
@@ -148,7 +224,7 @@ extern "system" fn input_probe_thread(_param: *mut c_void) -> u32 {
                 list.join(" ")
             );
         }
-        unsafe { sys::Sleep(2000) };
+        unsafe { sys::Sleep(if tick < 150 { 100 } else { 2000 }) };
     }
 }
 
@@ -318,9 +394,93 @@ fn patch_peb(base: usize, size_of_image: u32, path: &Path, argv: &[String]) {
                 write_unicode_string(first + LDR_FULL_DLL_NAME, full_w.ptr, full_w.byte_len);
                 write_unicode_string(first + LDR_BASE_DLL_NAME, file_w.ptr, file_w.byte_len);
             }
+            // Hand-built LDR entries break ntdll's private module index
+            // (RB tree/hash) -- diagnostic only, off by default.
+            if std::env::var_os("PELDR_LDR_ENTRY").is_some() {
+                install_ldr_entry(peb, base, size_of_image, &full_w, &file_w);
+            }
         }
     }
     vlog!("peb patched: image base {base:#x}, size {size_of_image:#x}, argv0 {:?}", argv.first());
+}
+
+/// Insert a real LDR_DATA_TABLE_ENTRY for the mapped image into the three
+/// PEB module lists, so module enumeration by name/address finds the target
+/// image itself (like a normally loaded main module).
+unsafe fn install_ldr_entry(
+    peb: usize,
+    base: usize,
+    size_of_image: u32,
+    full_w: &Wide,
+    file_w: &Wide,
+) {
+    #[repr(C)]
+    struct ListEntry {
+        flink: usize,
+        blink: usize,
+    }
+    #[repr(C)]
+    struct LdrEntry {
+        in_load_order: ListEntry,       // +0x00
+        in_memory_order: ListEntry,     // +0x10
+        in_init_order: ListEntry,       // +0x20
+        dll_base: usize,                // +0x30
+        entry_point: usize,             // +0x38
+        size_of_image: u32,             // +0x40
+        _pad: u32,
+        full_dll_name: [u8; 16],        // +0x48 (UNICODE_STRING)
+        base_dll_name: [u8; 16],        // +0x58
+        flags: u32,                     // +0x68
+        pad2: u32,
+    }
+    unsafe {
+        let ldr = *((peb + PEB_LDR) as *const usize);
+        if ldr == 0 {
+            return;
+        }
+        // The loader's own first entry keeps the batch: we link the mapped
+        // image in directly after it in all three lists.
+        let load_head = ldr + LDR_IN_LOAD_ORDER; // InLoadOrderModuleList head
+        // Offsets of the list heads inside PEB_LDR_DATA: InLoadOrder +0x10,
+        // InMemoryOrder +0x20, InInitializationOrder +0x30.
+        let mem_head = ldr + 0x20;
+        let init_head = ldr + 0x30;
+
+        let e = match core::alloc::Layout::from_size_align(std::mem::size_of::<LdrEntry>(), 16) {
+            Ok(l) => unsafe { std::alloc::alloc(l) as *mut LdrEntry },
+            Err(_) => std::ptr::null_mut(),
+        };
+        if e.is_null() {
+            return;
+        }
+        std::ptr::write_bytes(e as *mut u8, 0, std::mem::size_of::<LdrEntry>());
+        (*e).dll_base = base;
+        (*e).size_of_image = size_of_image;
+        let first = *(load_head as *const usize);
+        (*e).flags = if first != load_head && first != 0 {
+            *((first + 0x68) as *const u32)
+        } else {
+            0
+        };
+        // Names (UNICODE_STRING inside the entry).
+        write_unicode_string(e as usize + 0x48, full_w.ptr, full_w.byte_len);
+        write_unicode_string(e as usize + 0x58, file_w.ptr, file_w.byte_len);
+
+        // Link into each list, right after the head (so the mapped image is
+        // the FIRST module the target sees).
+        let link = |entry_off: usize, head: usize| {
+            let e_link = e as usize + entry_off;
+            let old_first = *(head as *const usize);
+            *((e_link) as *mut usize) = old_first; // Flink = old first
+            *((e_link + 8) as *mut usize) = head; // Blink = head
+            *(head as *mut usize) = e_link; // head.Flink = us
+            *((old_first + 8) as *mut usize) = e_link; // old first's Blink = us
+        };
+        link(0x00, load_head);
+        link(0x10, mem_head);
+        link(0x20, init_head);
+        vlog!("peb: installed LDR entry {:#x} for the mapped image", e as usize);
+    }
 }
 
 /// (buffer pointer, byte length without NUL)

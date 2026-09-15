@@ -81,6 +81,9 @@ static REAL_K32_ENUM_PROCESS_MODULES: AtomicUsize = AtomicUsize::new(0);
 static REAL_K32_GET_MODULE_BASE_NAME_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_K32_GET_MODULE_FILE_NAME_EX_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_VIRTUAL_QUERY: AtomicUsize = AtomicUsize::new(0);
+static REAL_WRITE_CONSOLE_INPUT_W: AtomicUsize = AtomicUsize::new(0);
+static REAL_WRITE_CONSOLE_W: AtomicUsize = AtomicUsize::new(0);
+static REAL_WRITE_FILE: AtomicUsize = AtomicUsize::new(0);
 /// Context pointer of the last console-input wait registration (filetype 2).
 /// Used by the freeze watchdog to dump the app's console-driver state.
 pub static CONSOLE_WAIT_CTX: AtomicUsize = AtomicUsize::new(0);
@@ -123,6 +126,9 @@ pub fn init_reals() {
     set(&REAL_K32_GET_MODULE_BASE_NAME_W, "K32GetModuleBaseNameW");
     set(&REAL_K32_GET_MODULE_FILE_NAME_EX_W, "K32GetModuleFileNameExW");
     set(&REAL_VIRTUAL_QUERY, "VirtualQuery");
+    set(&REAL_WRITE_CONSOLE_INPUT_W, "WriteConsoleInputW");
+    set(&REAL_WRITE_CONSOLE_W, "WriteConsoleW");
+    set(&REAL_WRITE_FILE, "WriteFile");
     if let Some(p) = sys::ntdll_proc("RtlPcToFileHeader") {
         REAL_RTL_PC_TO_FILE_HEADER.store(p, Ordering::Relaxed);
     }
@@ -1066,6 +1072,22 @@ extern "system" fn shim_post_queued_completion(
     if bare_mode() {
         return unsafe { f(port, bytes, key, overlapped) };
     }
+    // Race-fixer (default on): the app's own terminal-detection writes make
+    // the arming wait fire; if the resulting wake packet is processed while
+    // the console driver sits in its reset window (state 0), the pending
+    // read request takes the wrong (line-mode) branch and interactive input
+    // dies. Delaying the console-driver wake lets the reset finish first.
+    // PELDR_WAKE_DELAY_US overrides the delay (0 disables).
+    let ctx = CONSOLE_WAIT_CTX.load(Ordering::Relaxed);
+    if ctx != 0 && overlapped as usize == ctx + 0x40 {
+        let us = std::env::var("PELDR_WAKE_DELAY_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20000);
+        if us > 0 {
+            unsafe { sys::Sleep((us / 1000).max(1) as u32) };
+        }
+    }
     let rc = unsafe { f(port, bytes, key, overlapped) };
     vlog!(
         "shim: PostQueuedCompletionStatus(port {port:p}, key {key:#x}, ov {overlapped:p}) -> {rc} tid {}",
@@ -1122,6 +1144,98 @@ extern "system" fn shim_get_queued_completion_ex(
             "shim: GQCSEx(port {port:p}) -> {rc} n={n} waited {elapsed}ms tid {}",
             unsafe { sys::GetCurrentThreadId() }
         );
+    }
+    rc
+}
+
+/// WriteConsoleInputW: shows who synthesizes console input events (e.g. the
+/// app's own terminal-detection replies) and their timing.
+extern "system" fn shim_write_console_input_w(
+    h: Handle,
+    records: *const c_void,
+    len: u32,
+    written: *mut u32,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, *const c_void, u32, *mut u32) -> i32 =
+        unsafe { std::mem::transmute(REAL_WRITE_CONSOLE_INPUT_W.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(h, records, len, written) };
+    let n = if written.is_null() { 0 } else { unsafe { *written } };
+    // INPUT_RECORD x64: EventType u16 + pad u16 + KEY_EVENT { bKeyDown(4) rep(2) vk(2) sc(2) uChar(2) ctrl(4) }
+    let mut desc = String::new();
+    if !records.is_null() {
+        for i in 0..n.min(16) as usize {
+            let base = unsafe { (records as *const u8).add(i * 20) };
+            let et = unsafe { *(base as *const u16) };
+            if et == 1 {
+                let vk = unsafe { *((base.add(8)) as *const u16) };
+                let ch = unsafe { *((base.add(12)) as *const u16) };
+                desc.push_str(&format!(" KEY(vk {vk:#x} ch {ch:#x})"));
+            } else {
+                desc.push_str(&format!(" evt{et}"));
+            }
+        }
+    }
+    vlog!(
+        "shim: WriteConsoleInputW({h:p}, {len} records) -> {rc} written {n} tid {}:{desc}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
+    rc
+}
+
+/// WriteFile: log short console writes containing escape sequences (the
+/// terminal-detection queries) so we can align them with the console's
+/// synthesized replies.
+extern "system" fn shim_write_file(
+    h: Handle,
+    buf: *const u8,
+    len: u32,
+    written: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, *const u8, u32, *mut u32, *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(REAL_WRITE_FILE.load(Ordering::Relaxed)) };
+    if !buf.is_null() && len > 0 && len <= 64 && unsafe { sys::GetFileType(h) } == 3 {
+        // FILE_TYPE_CHAR: console-ish handle
+        let s = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+        let esccount = s.iter().filter(|&&c| c == 0x1b).count();
+        if esccount > 0 {
+            let text: String = s
+                .iter()
+                .map(|&c| if c >= 0x20 && c < 0x7f { c as char } else { '.' })
+                .collect();
+            vlog!(
+                "shim: WriteFile({h:p}, len {len}) esc {esccount} [{text}] tid {}",
+                unsafe { sys::GetCurrentThreadId() }
+            );
+        }
+    }
+    unsafe { f(h, buf, len, written, overlapped) }
+}
+extern "system" fn shim_write_console_w(
+    h: Handle,
+    buf: *const u16,
+    len: u32,
+    written: *mut u32,
+    reserved: *mut c_void,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, *const u16, u32, *mut u32, *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(REAL_WRITE_CONSOLE_W.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(h, buf, len, written, reserved) };
+    let n = if written.is_null() { 0 } else { unsafe { *written } };
+    // Log only short writes that look like escape-sequence queries.
+    if !buf.is_null() && len > 0 && len <= 32 {
+        let s = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+        let esccount = s.iter().filter(|&&c| c == 0x1b).count();
+        if esccount > 0 {
+            let text: String = s
+                .iter()
+                .map(|&c| if c >= 0x20 && c < 0x7f { c as u8 as char } else { '.' })
+                .collect();
+            vlog!(
+                "shim: WriteConsoleW({h:p}, len {len}) -> {rc} written {n} esc {esccount} [{text}] tid {}",
+                unsafe { sys::GetCurrentThreadId() }
+            );
+        }
     }
     rc
 }
@@ -1800,6 +1914,15 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
             }
             "SetConsoleMode" if have(&REAL_SET_CONSOLE_MODE) => {
                 cast(shim_set_console_mode as *const ())
+            }
+            "WriteConsoleInputW" if have(&REAL_WRITE_CONSOLE_INPUT_W) => {
+                cast(shim_write_console_input_w as *const ())
+            }
+            "WriteConsoleW" if have(&REAL_WRITE_CONSOLE_W) => {
+                cast(shim_write_console_w as *const ())
+            }
+            "WriteFile" if have(&REAL_WRITE_FILE) => {
+                cast(shim_write_file as *const ())
             }
             "ReadConsoleW" if have(&REAL_READ_CONSOLE_W) => {
                 cast(shim_read_console_w as *const ())
