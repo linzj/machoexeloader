@@ -79,7 +79,14 @@ unsafe extern "system" fn start_thread(p: *mut c_void) -> u32 {
         return 127;
     }
     crate::tls::run_callbacks();
-    crate::tls::run_thread_attach_callbacks();
+    // A real process does not deliver DLL_THREAD_ATTACH to the exe/loader
+    // for its initial thread. Diagnose whether the extra pass confuses
+    // per-thread runtime init (PELDR_NO_MT_ATTACH skips it).
+    static SKIP_MT_ATTACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let skip = *SKIP_MT_ATTACH.get_or_init(|| std::env::var_os("PELDR_NO_MT_ATTACH").is_some());
+    if !skip {
+        crate::tls::run_thread_attach_callbacks();
+    }
     vlog!("jumping to target entry {:#x}", es.entry);
     let f: unsafe extern "system" fn() -> i32 = unsafe { std::mem::transmute(es.entry) };
     let ret = unsafe { f() };
@@ -88,9 +95,12 @@ unsafe extern "system" fn start_thread(p: *mut c_void) -> u32 {
     ret as u32
 }
 
-/// Verbose-only: report the stdin handle's nature and pending console input
-/// count every couple of seconds, so a "keys do nothing" report can be
-/// split into "input never reaches the console" vs "wait/callback broken".
+/// Verbose-only watchdog: report the stdin handle's nature and pending console
+/// input count every couple of seconds, plus the shim event counters and the
+/// tracked-thread inventory every 10 seconds. A "keys do nothing" report can
+/// then be split into "input never reaches the console" vs "wait/callback
+/// broken" vs "target stopped consuming events", and the last counter
+/// snapshot narrows down where execution stalled.
 extern "system" fn input_probe_thread(_param: *mut c_void) -> u32 {
     // A raw thread: Rust std threads are unsafe here because the loader's
     // `_tls_index` was moved to slot C, so extend this thread's TLS first.
@@ -103,11 +113,90 @@ extern "system" fn input_probe_thread(_param: *mut c_void) -> u32 {
     let cm = unsafe { sys::GetConsoleMode(h, &mut mode) };
     let ft = unsafe { sys::GetFileType(h) };
     vlog!("input probe: stdin {h:p} consolemode ok={cm} mode={mode:#x} filetype={ft}");
+    let mut tick = 0u32;
+    let mut last_reads = 0usize;
+    let mut frozen_ticks = 0u32;
     loop {
         let mut n = 0u32;
         let ok = unsafe { sys::GetNumberOfConsoleInputEvents(h, &mut n) };
         vlog!("input probe: pending events ok={ok} n={n}");
+        // Freeze detection: console events are waiting, but the target has
+        // not read any for ~12s. Dump the console-driver state once.
+        let reads = crate::diag::CON_READS.load(std::sync::atomic::Ordering::Relaxed);
+        if ok != 0 && n > 0 && reads == last_reads && reads > 0 {
+            frozen_ticks += 1;
+        } else {
+            frozen_ticks = 0;
+        }
+        if frozen_ticks == 6 {
+            dump_console_freeze_state(n);
+        }
+        last_reads = reads;
+        tick += 1;
+        if tick % 5 == 0 {
+            vlog!("watchdog: {}", crate::diag::snapshot());
+            let threads = crate::tls::snapshot_threads();
+            let list: Vec<String> = threads
+                .iter()
+                .map(|(tid, t, r)| {
+                    format!("{tid}{}{}", if *t { "/T" } else { "" }, if *r { "/R" } else { "" })
+                })
+                .collect();
+            vlog!(
+                "watchdog: {} tracked thread(s): {}",
+                list.len(),
+                list.join(" ")
+            );
+        }
         unsafe { sys::Sleep(2000) };
+    }
+}
+
+/// One-shot diagnostic: dump the app's console-driver state structures when
+/// the input pipeline has died (events pending, no reads for seconds).
+fn dump_console_freeze_state(pending: u32) {
+    static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let ctx = crate::shim::CONSOLE_WAIT_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    vlog!("freeze-dump: pending {pending} events, console wait ctx {ctx:#x}");
+    if ctx == 0 {
+        return;
+    }
+    dump_mem("ctx-region", ctx.saturating_sub(0x80), 0x200);
+    let g = read_u64(ctx).unwrap_or(0);
+    if g != 0 && (g as isize - ctx as isize).unsigned_abs() <= 0x4000 {
+        dump_mem("G", g, 0x200);
+        for (name, off) in [("A", 0usize), ("B", 8), ("C", 0x20), ("D", 0x28)] {
+            if let Some(p) = read_u64(g + off) {
+                if p > 0x10000 && p < 0x0000_8000_0000_0000 {
+                    dump_mem(name, p, 0x140);
+                }
+            }
+        }
+    }
+}
+
+fn read_u64(addr: usize) -> Option<usize> {
+    if !sys::is_readable(addr, 8) {
+        return None;
+    }
+    Some(unsafe { *(addr as *const usize) })
+}
+
+fn dump_mem(label: &str, base: usize, len: usize) {
+    let mut addr = base;
+    while addr < base + len {
+        if !sys::is_readable(addr, 16) {
+            vlog!("freeze-dump: {label} {addr:#x}: <unreadable>");
+            addr += 16;
+            continue;
+        }
+        let v0 = unsafe { *(addr as *const u64) };
+        let v1 = unsafe { *((addr + 8) as *const u64) };
+        vlog!("freeze-dump: {label} {addr:#x}: {v0:016x} {v1:016x}");
+        addr += 16;
     }
 }
 

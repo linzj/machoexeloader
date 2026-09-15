@@ -234,6 +234,7 @@ fn attach_for_teb(teb: usize, is_target: bool, reusable: bool) -> Result<(), Str
     let tid = unsafe { sys::GetCurrentThreadId() };
     if let Some(pos) = st.threads.iter().position(|t| t.teb == teb) {
         if st.threads[pos].tid == tid {
+            vlog!("tls: thread {teb:#x} (tid {tid}) already attached; reusing array");
             return Ok(());
         }
         // TEB address reused by a new thread: drop the stale record.
@@ -324,6 +325,7 @@ pub fn restore_current_thread_array() {
 /// Called from the LoadLibrary shims after a host module was loaded: ntdll
 /// may have just claimed slot C for a new TLS module.
 pub fn on_host_module_load() {
+    crate::diag::bump(&crate::diag::HOST_LOADS);
     let mut guard = match STATE.lock() {
         Ok(g) => g,
         Err(_) => return,
@@ -333,6 +335,19 @@ pub fn on_host_module_load() {
             crate::rerr!("TLS maintenance failed: {e}");
         }
     }
+}
+
+/// (tid, is_target, reusable) of every tracked thread, for the watchdog.
+pub fn snapshot_threads() -> Vec<(u32, bool, bool)> {
+    let guard = match STATE.lock() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    let Some(st) = guard.as_ref() else { return Vec::new() };
+    st.threads
+        .iter()
+        .map(|t| (t.tid, t.is_target, t.reusable))
+        .collect()
 }
 
 fn maintain_locked(st: &mut TlsState) -> Result<(), String> {

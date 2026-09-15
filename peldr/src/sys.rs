@@ -71,6 +71,7 @@ unsafe extern "system" {
 
     pub fn GetLastError() -> u32;
     pub fn GetCurrentThreadId() -> u32;
+    pub fn GetTickCount64() -> u64;
     pub fn GetStdHandle(nStdHandle: u32) -> Handle;
     pub fn GetConsoleMode(hConsoleHandle: Handle, lpMode: *mut u32) -> i32;
     pub fn GetFileType(hFile: Handle) -> u32;
@@ -97,6 +98,46 @@ unsafe extern "system" {
     pub fn Thread32First(hSnapshot: Handle, lpte: *mut ThreadEntry32) -> i32;
     pub fn Thread32Next(hSnapshot: Handle, lpte: *mut ThreadEntry32) -> i32;
     pub fn OpenThread(dwDesiredAccess: u32, bInheritHandle: i32, dwThreadId: u32) -> Handle;
+    pub fn VirtualQuery(
+        lpAddress: *const c_void,
+        lpBuffer: *mut MemoryBasicInformation,
+        dwLength: usize,
+    ) -> usize;
+}
+
+#[repr(C)]
+pub struct MemoryBasicInformation {
+    pub base_address: usize,
+    pub allocation_base: usize,
+    pub allocation_protect: u32,
+    pub _pad1: u32,
+    pub region_size: usize,
+    pub state: u32,
+    pub protect: u32,
+    pub ty: u32,
+    pub _pad2: u32,
+}
+
+/// Is [addr, addr+len) committed and readable? For the diagnostic dumps only.
+pub fn is_readable(addr: usize, len: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let mut mbi: MemoryBasicInformation = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        VirtualQuery(
+            addr as *const c_void,
+            &mut mbi,
+            std::mem::size_of::<MemoryBasicInformation>(),
+        )
+    };
+    if r == 0 || mbi.state != MEM_COMMIT {
+        return false;
+    }
+    if mbi.protect & (PAGE_NOACCESS | 0x100) != 0 {
+        return false;
+    }
+    addr + len <= mbi.base_address + mbi.region_size
 }
 
 #[repr(C)]
