@@ -103,6 +103,13 @@ unsafe extern "system" {
         lpBuffer: *mut MemoryBasicInformation,
         dwLength: usize,
     ) -> usize;
+    pub fn CreateFiber(
+        dwStackSize: usize,
+        lpStartAddress: Option<unsafe extern "system" fn(*mut c_void) -> !>,
+        lpParameter: *mut c_void,
+    ) -> *mut c_void;
+    pub fn ConvertThreadToFiber(lpParameter: *mut c_void) -> *mut c_void;
+    pub fn SwitchToFiber(lpFiber: *mut c_void);
 }
 
 #[repr(C)]
