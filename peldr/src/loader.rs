@@ -25,6 +25,10 @@ pub struct Registry {
 /// fail-fast (0xC0000374). Loading the usual lazily-pulled DLLs up front
 /// keeps the host TLS-module count stable for the whole run.
 fn preload_host_gui_stack() {
+    if std::env::var_os("PELDR_NO_PRELOAD").is_some() {
+        vlog!("preload_host_gui_stack skipped (PELDR_NO_PRELOAD)");
+        return;
+    }
     const DLLS: &[&str] = &[
         "user32.dll",
         "gdi32.dll",

@@ -70,6 +70,20 @@ static REAL_EXIT_PROCESS: AtomicUsize = AtomicUsize::new(0);
 static REAL_EXIT_THREAD: AtomicUsize = AtomicUsize::new(0);
 static REAL_TERMINATE_PROCESS: AtomicUsize = AtomicUsize::new(0);
 static REAL_GET_CURRENT_PROCESS: AtomicUsize = AtomicUsize::new(0);
+static REAL_SET_CONSOLE_MODE: AtomicUsize = AtomicUsize::new(0);
+static REAL_READ_CONSOLE_W: AtomicUsize = AtomicUsize::new(0);
+static REAL_GET_NUM_CONSOLE_EVENTS: AtomicUsize = AtomicUsize::new(0);
+static REAL_GET_QUEUED_EX: AtomicUsize = AtomicUsize::new(0);
+static REAL_GET_MODULE_HANDLE_EX_W: AtomicUsize = AtomicUsize::new(0);
+static REAL_GET_MODULE_HANDLE_EX_A: AtomicUsize = AtomicUsize::new(0);
+static REAL_RTL_PC_TO_FILE_HEADER: AtomicUsize = AtomicUsize::new(0);
+static REAL_K32_ENUM_PROCESS_MODULES: AtomicUsize = AtomicUsize::new(0);
+static REAL_K32_GET_MODULE_BASE_NAME_W: AtomicUsize = AtomicUsize::new(0);
+static REAL_K32_GET_MODULE_FILE_NAME_EX_W: AtomicUsize = AtomicUsize::new(0);
+static REAL_VIRTUAL_QUERY: AtomicUsize = AtomicUsize::new(0);
+/// Context pointer of the last console-input wait registration (filetype 2).
+/// Used by the freeze watchdog to dump the app's console-driver state.
+pub static CONSOLE_WAIT_CTX: AtomicUsize = AtomicUsize::new(0);
 
 static GET_PROC_CACHE: Mutex<Option<HashMap<(usize, String), Option<usize>>>> = Mutex::new(None);
 
@@ -99,6 +113,19 @@ pub fn init_reals() {
     set(&REAL_UNREGISTER_WAIT, "UnregisterWait");
     set(&REAL_UNREGISTER_WAIT_EX, "UnregisterWaitEx");
     set(&REAL_READ_CONSOLE_INPUT_W, "ReadConsoleInputW");
+    set(&REAL_SET_CONSOLE_MODE, "SetConsoleMode");
+    set(&REAL_READ_CONSOLE_W, "ReadConsoleW");
+    set(&REAL_GET_NUM_CONSOLE_EVENTS, "GetNumberOfConsoleInputEvents");
+    set(&REAL_GET_QUEUED_EX, "GetQueuedCompletionStatusEx");
+    set(&REAL_GET_MODULE_HANDLE_EX_W, "GetModuleHandleExW");
+    set(&REAL_GET_MODULE_HANDLE_EX_A, "GetModuleHandleExA");
+    set(&REAL_K32_ENUM_PROCESS_MODULES, "K32EnumProcessModules");
+    set(&REAL_K32_GET_MODULE_BASE_NAME_W, "K32GetModuleBaseNameW");
+    set(&REAL_K32_GET_MODULE_FILE_NAME_EX_W, "K32GetModuleFileNameExW");
+    set(&REAL_VIRTUAL_QUERY, "VirtualQuery");
+    if let Some(p) = sys::ntdll_proc("RtlPcToFileHeader") {
+        REAL_RTL_PC_TO_FILE_HEADER.store(p, Ordering::Relaxed);
+    }
     set(&REAL_POST_QUEUED, "PostQueuedCompletionStatus");
     if let Some(p) = sys::ntdll_proc("NtCreateThreadEx") {
         REAL_NT_CREATE_THREAD_EX.store(p, Ordering::Relaxed);
@@ -324,6 +351,24 @@ fn base_index(h: Handle) -> Option<usize> {
     images.iter().position(|im| im.base == b)
 }
 
+/// Base of the self-mapped image containing `addr`, if any. Answers
+/// RtlPcToFileHeader / GetModuleHandleEx(FROM_ADDRESS) for the mapped images
+/// which the host loader database does not know about.
+fn self_base_for_address(addr: usize) -> Option<usize> {
+    let v = VIEW.get()?;
+    let images = v.images.lock().ok()?;
+    images
+        .iter()
+        .find(|im| addr >= im.base && addr < im.base + im.size as usize)
+        .map(|im| im.base)
+}
+
+fn main_image_base() -> Option<usize> {
+    let v = VIEW.get()?;
+    let images = v.images.lock().ok()?;
+    images.first().map(|im| im.base)
+}
+
 fn view_base(i: usize) -> usize {
     view().images.lock().unwrap()[i].base
 }
@@ -349,11 +394,13 @@ fn self_or_runtime(name: &str) -> Option<usize> {
     if let Some(i) = find_self(name) {
         let base = view_base(i);
         vlog!("shim: LoadLibrary({name}) -> self-mapped {base:#x}");
+        crate::diag::bump(&crate::diag::TARGET_LOADS);
         return Some(base);
     }
     match runtime_load_self_dll(name) {
         Ok(Some(base)) => {
             vlog!("shim: LoadLibrary({name}) -> runtime self-map {base:#x}");
+            crate::diag::bump(&crate::diag::TARGET_LOADS);
             Some(base)
         }
         Ok(None) => None,
@@ -621,10 +668,12 @@ extern "system" fn shim_get_proc_address(hmod: Handle, name: *const c_char) -> *
     } else {
         let s = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
         if let Some(a) = dynamic_override(&s) {
+            vlog!("shim: GPA override {s} -> {a:#x}");
             return a as *mut c_void;
         }
         (hmod as usize, s)
     };
+    crate::diag::bump(&crate::diag::GPA_CALLS);
     let mut guard = GET_PROC_CACHE.lock().unwrap();
     let cache = guard.get_or_insert_with(HashMap::new);
     if let Some(&c) = cache.get(&key) {
@@ -634,6 +683,15 @@ extern "system" fn shim_get_proc_address(hmod: Handle, name: *const c_char) -> *
         unsafe { std::mem::transmute(REAL_GET_PROC_ADDRESS.load(Ordering::Relaxed)) };
     let p = unsafe { f(hmod, name) };
     cache.insert(key, if p.is_null() { None } else { Some(p as usize) });
+    drop(guard);
+    crate::diag::bump(&crate::diag::GPA_RESOLVED);
+    // A value <= 0xFFFF arrives as MAKEINTRESOURCE ordinal, not a pointer.
+    let label = if name as usize <= 0xFFFF {
+        format!("#{}", name as usize)
+    } else {
+        unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned()
+    };
+    vlog!("shim: GPA(first) {label} -> {p:p}");
     p
 }
 
@@ -642,10 +700,191 @@ extern "system" fn shim_get_module_handle_w(name: *const u16) -> Handle {
         if let Some(i) = find_self(&s) {
             return view_base(i) as Handle;
         }
+    } else if name.is_null() {
+        // The target thinks it is the process image: answer with the mapped
+        // main image, not the loader's own base.
+        if let Some(b) = main_image_base() {
+            return b as Handle;
+        }
     }
     let f: unsafe extern "system" fn(*const u16) -> Handle =
         unsafe { std::mem::transmute(REAL_GET_MODULE_HANDLE_W.load(Ordering::Relaxed)) };
     unsafe { f(name) }
+}
+
+/// GetModuleHandleExW/A: serve FROM_ADDRESS lookups for addresses inside the
+/// manually mapped images -- the host loader database has no entry for them,
+/// so the real API returns NULL where a real process would return a base.
+extern "system" fn shim_get_module_handle_ex_w(flags: u32, name: *const u16, out: *mut Handle) -> i32 {
+    const FROM_ADDRESS: u32 = 0x4;
+    if !out.is_null() {
+        if name.is_null() {
+            if let Some(b) = main_image_base() {
+                unsafe { *out = b as Handle };
+                return 1;
+            }
+        } else if flags & FROM_ADDRESS != 0 {
+            if let Some(b) = self_base_for_address(name as usize) {
+                vlog!("shim: GetModuleHandleExW(FROM_ADDRESS {:#x}) -> {b:#x}", name as usize);
+                unsafe { *out = b as Handle };
+                return 1;
+            }
+        } else if let Some(s) = wide_to_string(name) {
+            if let Some(i) = find_self(&s) {
+                unsafe { *out = view_base(i) as Handle };
+                return 1;
+            }
+        }
+    }
+    let f: unsafe extern "system" fn(u32, *const u16, *mut Handle) -> i32 =
+        unsafe { std::mem::transmute(REAL_GET_MODULE_HANDLE_EX_W.load(Ordering::Relaxed)) };
+    unsafe { f(flags, name, out) }
+}
+
+extern "system" fn shim_get_module_handle_ex_a(flags: u32, name: *const c_char, out: *mut Handle) -> i32 {
+    const FROM_ADDRESS: u32 = 0x4;
+    if !out.is_null() {
+        if name.is_null() {
+            if let Some(b) = main_image_base() {
+                unsafe { *out = b as Handle };
+                return 1;
+            }
+        } else if flags & FROM_ADDRESS != 0 {
+            if let Some(b) = self_base_for_address(name as usize) {
+                unsafe { *out = b as Handle };
+                return 1;
+            }
+        } else {
+            let s = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+            if let Some(i) = find_self(&s) {
+                unsafe { *out = view_base(i) as Handle };
+                return 1;
+            }
+        }
+    }
+    let f: unsafe extern "system" fn(u32, *const c_char, *mut Handle) -> i32 =
+        unsafe { std::mem::transmute(REAL_GET_MODULE_HANDLE_EX_A.load(Ordering::Relaxed)) };
+    unsafe { f(flags, name, out) }
+}
+
+/// RtlPcToFileHeader: "which module contains this address" -- a staple of
+/// stack walking / module resolution. Without this the target cannot locate
+/// its own code and data ranges.
+extern "system" fn shim_rtl_pc_to_file_header(pc: *mut c_void, base_out: *mut *mut c_void) -> *mut c_void {
+    if let Some(b) = self_base_for_address(pc as usize) {
+        if !base_out.is_null() {
+            unsafe { *base_out = b as *mut c_void };
+        }
+        return b as *mut c_void;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(REAL_RTL_PC_TO_FILE_HEADER.load(Ordering::Relaxed)) };
+    unsafe { f(pc, base_out) }
+}
+
+extern "system" fn shim_k32_get_module_base_name_w(
+    process: Handle,
+    module: Handle,
+    buf: *mut u16,
+    size: u32,
+) -> u32 {
+    if let Some(i) = base_index(module) {
+        let v = view();
+        let images = v.images.lock().unwrap();
+        let w = sys::to_wide(&images[i].name);
+        return write_wide(&w, buf, size);
+    }
+    let f: unsafe extern "system" fn(Handle, Handle, *mut u16, u32) -> u32 =
+        unsafe { std::mem::transmute(REAL_K32_GET_MODULE_BASE_NAME_W.load(Ordering::Relaxed)) };
+    unsafe { f(process, module, buf, size) }
+}
+
+extern "system" fn shim_k32_get_module_file_name_ex_w(
+    process: Handle,
+    module: Handle,
+    buf: *mut u16,
+    size: u32,
+) -> u32 {
+    if let Some(i) = base_index(module) {
+        let v = view();
+        let images = v.images.lock().unwrap();
+        if i == 0 {
+            if let Some(w) = TARGET_PATH_W.get() {
+                return write_wide(w, buf, size);
+            }
+        }
+        if let Some(p) = images[i].path.as_ref() {
+            let w = sys::to_wide(&p.display().to_string());
+            return write_wide(&w, buf, size);
+        }
+    }
+    let f: unsafe extern "system" fn(Handle, Handle, *mut u16, u32) -> u32 =
+        unsafe { std::mem::transmute(REAL_K32_GET_MODULE_FILE_NAME_EX_W.load(Ordering::Relaxed)) };
+    unsafe { f(process, module, buf, size) }
+}
+
+/// VirtualQuery: manually mapped image pages are MEM_PRIVATE; a real loaded
+/// image is MEM_IMAGE. Runtime address classification (image vs anonymous)
+/// reads the type, so report MEM_IMAGE for our mapped ranges.
+extern "system" fn shim_virtual_query(
+    addr: *const c_void,
+    mbi: *mut sys::MemoryBasicInformation,
+    len: usize,
+) -> usize {
+    let f: unsafe extern "system" fn(*const c_void, *mut sys::MemoryBasicInformation, usize) -> usize =
+        unsafe { std::mem::transmute(REAL_VIRTUAL_QUERY.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(addr, mbi, len) };
+    const MEM_IMAGE: u32 = 0x100_0000;
+    const MEM_PRIVATE: u32 = 0x2_0000;
+    if rc != 0 && !mbi.is_null() {
+        let a = addr as usize;
+        if self_base_for_address(a).is_some() {
+            let m = unsafe { &mut *mbi };
+            if m.ty == MEM_PRIVATE {
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    vlog!("shim: VirtualQuery({a:#x}) type MEM_PRIVATE -> MEM_IMAGE (mapped image)");
+                }
+                m.ty = MEM_IMAGE;
+            }
+        }
+    }
+    rc
+}
+extern "system" fn shim_k32_enum_process_modules(
+    process: Handle,
+    modules: *mut Handle,
+    cb: u32,
+    needed: *mut u32,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, *mut Handle, u32, *mut u32) -> i32 =
+        unsafe { std::mem::transmute(REAL_K32_ENUM_PROCESS_MODULES.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(process, modules, cb, needed) };
+    let self_proc = unsafe { sys::GetCurrentProcess() };
+    if process == self_proc || process as isize == -1 {
+        if let Some(m) = main_image_base() {
+            let count = if needed.is_null() { 0 } else { (unsafe { *needed }) as usize } / std::mem::size_of::<Handle>();
+            if !modules.is_null() && cb > 0 {
+                let cap = cb as usize / std::mem::size_of::<Handle>();
+                let mut found = false;
+                for i in 0..count.min(cap) {
+                    if unsafe { *(modules.add(i)) } as usize == m {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found && count < cap {
+                    unsafe { *(modules.add(count)) = m as Handle };
+                    if !needed.is_null() {
+                        unsafe { *needed += std::mem::size_of::<Handle>() as u32 };
+                    }
+                    vlog!("shim: K32EnumProcessModules appended main image {m:#x} (was {count} modules)");
+                }
+            }
+        }
+    }
+    rc
 }
 
 extern "system" fn shim_get_module_handle_a(name: *const c_char) -> Handle {
@@ -654,6 +893,8 @@ extern "system" fn shim_get_module_handle_a(name: *const c_char) -> Handle {
         if let Some(i) = find_self(&s) {
             return view_base(i) as Handle;
         }
+    } else if let Some(b) = main_image_base() {
+        return b as Handle;
     }
     let f: unsafe extern "system" fn(*const c_char) -> Handle =
         unsafe { std::mem::transmute(REAL_GET_MODULE_HANDLE_A.load(Ordering::Relaxed)) };
@@ -685,11 +926,13 @@ struct WaitStart {
 /// The TLS array must be rebuilt before target code runs and handed back
 /// afterwards: pool threads are reused for non-target work.
 unsafe extern "system" fn waiter_bootstrap(param: *mut c_void, fired: u8) {
+    crate::diag::bump(&crate::diag::WAITER_FIRES);
     let ws = unsafe { Box::from_raw(param as *mut WaitStart) };
     vlog!(
-        "shim: waiter fire (object {:#x}, cb {:#x}, fired {fired}) tid {}",
+        "shim: waiter fire (object {:#x}, cb {:#x}, ctx {:#x}, fired {fired}) tid {}",
         ws.object,
         ws.cb,
+        ws.ctx as usize,
         unsafe { sys::GetCurrentThreadId() }
     );
     if let Err(e) = crate::tls::attach_reusable_thread() {
@@ -705,6 +948,7 @@ unsafe extern "system" fn waiter_bootstrap(param: *mut c_void, fired: u8) {
     unsafe { f(ws.ctx, fired) };
     vlog!("shim: waiter tail (tid {}) callback done", unsafe { sys::GetCurrentThreadId() });
     crate::tls::restore_current_thread_array();
+    crate::diag::bump(&crate::diag::WAITER_TAILS);
 }
 
 extern "system" fn shim_register_wait(
@@ -717,11 +961,14 @@ extern "system" fn shim_register_wait(
 ) -> i32 {
     let f: unsafe extern "system" fn(*mut Handle, Handle, usize, *mut c_void, u32, u32) -> i32 =
         unsafe { std::mem::transmute(REAL_REGISTER_WAIT.load(Ordering::Relaxed)) };
-    if callback == 0 {
-        let rc = unsafe { f(new_wait, object, 0, context, milliseconds, flags) };
-        vlog!("shim: RegisterWaitForSingleObject(object {object:p}, cb null) -> {rc}");
+    if callback == 0 || bare_mode() {
+        let rc = unsafe { f(new_wait, object, callback, context, milliseconds, flags) };
+        if !bare_mode() {
+            vlog!("shim: RegisterWaitForSingleObject(object {object:p}, cb null) -> {rc}");
+        }
         return rc;
     }
+    crate::diag::bump(&crate::diag::REG_WAITS);
     if std::env::var_os("PELDR_NOWRAP").is_some() {
         // Diagnostic: register the target callback directly (no TLS wrap).
         let rc = unsafe { f(new_wait, object, callback, context, milliseconds, flags) };
@@ -747,8 +994,13 @@ extern "system" fn shim_register_wait(
     let ft = unsafe { sys::GetFileType(object) };
     let mut mode = 0u32;
     let cm = unsafe { sys::GetConsoleMode(object, &mut mode) };
+    if ft == 2 {
+        CONSOLE_WAIT_CTX.store(context as usize, Ordering::Relaxed);
+    }
+    let nw = if new_wait.is_null() { std::ptr::null_mut() } else { unsafe { *new_wait } };
     vlog!(
-        "shim: RegisterWaitForSingleObject(object {object:p}, cb {callback:#x}, flags {flags:#x}, ms {milliseconds}) -> {rc} err {err} filetype {ft} conmode {cm}/{mode:#x}"
+        "shim: RegisterWaitForSingleObject(object {object:p}, cb {callback:#x}, flags {flags:#x}, ms {milliseconds}) -> {rc} new_wait {nw:p} err {err} filetype {ft} conmode {cm}/{mode:#x} tid {}",
+        unsafe { sys::GetCurrentThreadId() }
     );
     rc
 }
@@ -756,14 +1008,23 @@ extern "system" fn shim_register_wait(
 extern "system" fn shim_unregister_wait(wait: Handle, completion_event: Handle) -> i32 {
     let f: unsafe extern "system" fn(Handle, Handle) -> i32 =
         unsafe { std::mem::transmute(REAL_UNREGISTER_WAIT.load(Ordering::Relaxed)) };
+    if bare_mode() {
+        return unsafe { f(wait, completion_event) };
+    }
     let rc = unsafe { f(wait, completion_event) };
-    vlog!("shim: UnregisterWait(wait {wait:p}, event {completion_event:p}) -> {rc}");
+    vlog!(
+        "shim: UnregisterWait(wait {wait:p}, event {completion_event:p}) -> {rc} tid {}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
     rc
 }
 
 extern "system" fn shim_unregister_wait_ex(wait: Handle, completion_event: Handle, flags: u32) -> i32 {
     let f: unsafe extern "system" fn(Handle, Handle, u32) -> i32 =
         unsafe { std::mem::transmute(REAL_UNREGISTER_WAIT_EX.load(Ordering::Relaxed)) };
+    if bare_mode() {
+        return unsafe { f(wait, completion_event, flags) };
+    }
     let rc = unsafe { f(wait, completion_event, flags) };
     vlog!("shim: UnregisterWaitEx(wait {wait:p}, event {completion_event:p}, flags {flags:#x}) -> {rc}");
     rc
@@ -777,15 +1038,20 @@ extern "system" fn shim_read_console_input_w(
 ) -> i32 {
     let f: unsafe extern "system" fn(Handle, *mut c_void, u32, *mut u32) -> i32 =
         unsafe { std::mem::transmute(REAL_READ_CONSOLE_INPUT_W.load(Ordering::Relaxed)) };
+    if bare_mode() {
+        return unsafe { f(h, records, len, read) };
+    }
     let rc = unsafe { f(h, records, len, read) };
     let n = if read.is_null() { 0 } else { unsafe { *read } };
-    if rc == 0 || n > 0 {
-        let err = unsafe { sys::GetLastError() };
-        vlog!(
-            "shim: ReadConsoleInputW({h:p}, len {len}) -> {rc} err {err} events {n} tid {}",
-            unsafe { sys::GetCurrentThreadId() }
-        );
+    crate::diag::bump(&crate::diag::CON_READS);
+    if n > 0 {
+        crate::diag::CON_EVENTS.fetch_add(n as usize, Ordering::Relaxed);
     }
+    let err = unsafe { sys::GetLastError() };
+    vlog!(
+        "shim: ReadConsoleInputW({h:p}, len {len}) -> {rc} err {err} events {n} tid {}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
     rc
 }
 
@@ -797,9 +1063,93 @@ extern "system" fn shim_post_queued_completion(
 ) -> i32 {
     let f: unsafe extern "system" fn(Handle, u32, usize, *mut c_void) -> i32 =
         unsafe { std::mem::transmute(REAL_POST_QUEUED.load(Ordering::Relaxed)) };
+    if bare_mode() {
+        return unsafe { f(port, bytes, key, overlapped) };
+    }
     let rc = unsafe { f(port, bytes, key, overlapped) };
     vlog!(
-        "shim: PostQueuedCompletionStatus(port {port:p}, key {key:#x}) -> {rc} tid {}",
+        "shim: PostQueuedCompletionStatus(port {port:p}, key {key:#x}, ov {overlapped:p}) -> {rc} tid {}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
+    rc
+}
+
+extern "system" fn shim_get_num_console_input_events(
+    h: Handle,
+    n: *mut u32,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, *mut u32) -> i32 =
+        unsafe { std::mem::transmute(REAL_GET_NUM_CONSOLE_EVENTS.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(h, n) };
+    let v = if n.is_null() { 0 } else { unsafe { *n } };
+    vlog!(
+        "shim: GetNumberOfConsoleInputEvents({h:p}) -> {rc} n={v} tid {}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
+    rc
+}
+
+extern "system" fn shim_get_queued_completion_ex(
+    port: Handle,
+    entries: *mut c_void,
+    count: u32,
+    removed: *mut u32,
+    ms: u32,
+    alertable: i32,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, *mut c_void, u32, *mut u32, u32, i32) -> i32 =
+        unsafe { std::mem::transmute(REAL_GET_QUEUED_EX.load(Ordering::Relaxed)) };
+    let t0 = unsafe { sys::GetTickCount64() };
+    let rc = unsafe { f(port, entries, count, removed, ms, alertable) };
+    let n = if removed.is_null() { 0 } else { unsafe { *removed } };
+    let elapsed = unsafe { sys::GetTickCount64() } - t0;
+    if n > 0 && !entries.is_null() {
+        // OVERLAPPED_ENTRY x64: lpOverlapped(0) Internal/key(8) InternalHigh(16) dwNumberOfBytesTransferred(24) pad(28)
+        let mut list = String::new();
+        for i in 0..n.min(8) as usize {
+            let base = unsafe { (entries as *const u8).add(i * 32) };
+            let ovp = unsafe { *(base as *const u64) };
+            let key = unsafe { *((base.add(8)) as *const u64) };
+            let bytes = unsafe { *((base.add(24)) as *const u32) };
+            list.push_str(&format!(" [{ovp:#x} k{key:#x} b{bytes}]"));
+        }
+        vlog!(
+            "shim: GQCSEx(port {port:p}) -> {rc} n={n} waited {elapsed}ms{list} tid {}",
+            unsafe { sys::GetCurrentThreadId() }
+        );
+    } else {
+        vlog!(
+            "shim: GQCSEx(port {port:p}) -> {rc} n={n} waited {elapsed}ms tid {}",
+            unsafe { sys::GetCurrentThreadId() }
+        );
+    }
+    rc
+}
+
+extern "system" fn shim_set_console_mode(h: Handle, mode: u32) -> i32 {
+    let f: unsafe extern "system" fn(Handle, u32) -> i32 =
+        unsafe { std::mem::transmute(REAL_SET_CONSOLE_MODE.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(h, mode) };
+    vlog!(
+        "shim: SetConsoleMode({h:p}, {mode:#x}) -> {rc} tid {}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
+    rc
+}
+
+extern "system" fn shim_read_console_w(
+    h: Handle,
+    buf: *mut u16,
+    len: u32,
+    read: *mut u32,
+    reserved: *mut c_void,
+) -> i32 {
+    let f: unsafe extern "system" fn(Handle, *mut u16, u32, *mut u32, *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(REAL_READ_CONSOLE_W.load(Ordering::Relaxed)) };
+    let rc = unsafe { f(h, buf, len, read, reserved) };
+    let v = if read.is_null() { 0 } else { unsafe { *read } };
+    vlog!(
+        "shim: ReadConsoleW({h:p}, len {len}) -> {rc} read {v} tid {}",
         unsafe { sys::GetCurrentThreadId() }
     );
     rc
@@ -884,7 +1234,11 @@ extern "system" fn shim_nt_create_thread_ex(
 }
 
 unsafe extern "system" fn thread_bootstrap(p: *mut c_void) -> u32 {
-    vlog!("shim: thread start (bootstrap entered)");
+    crate::diag::bump(&crate::diag::BOOTS);
+    vlog!(
+        "shim: thread start (bootstrap entered) tid {}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
     let ts = unsafe { Box::from_raw(p as *mut ThreadStart) };
     if let Err(e) = crate::tls::attach_current_thread() {
         crate::rerr!("TLS setup failed on new thread: {e}");
@@ -896,6 +1250,7 @@ unsafe extern "system" fn thread_bootstrap(p: *mut c_void) -> u32 {
     // Hand ntdll back a normal-looking TLS array before this thread dies.
     vlog!("shim: bootstrap tail (tid {}) target start returned {r}", unsafe { sys::GetCurrentThreadId() });
     crate::tls::restore_current_thread_array();
+    crate::diag::bump(&crate::diag::BOOT_RETS);
     vlog!("shim: target start returned {r}");
     r
 }
@@ -1012,6 +1367,14 @@ fn trace_sock() -> bool {
     *ON.get_or_init(|| std::env::var_os("PELDR_TRACE_SOCK").is_some())
 }
 
+/// Diagnostic: PELDR_BARE=1 makes the whole wait/read/wake path a pure
+/// passthrough (no wrapper, no extra calls, no logging) so it can be
+/// ruled in or out as the cause of an input-pipeline freeze.
+pub(crate) fn bare_mode() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PELDR_BARE").is_some())
+}
+
 extern "system" fn shim_wgetmainargs(
     argc: *mut i32,
     argv: *mut *mut *mut u16,
@@ -1107,6 +1470,7 @@ extern "system" fn shim_exit_process(code: u32) -> ! {
 }
 
 extern "system" fn shim_exit_thread(code: u32) -> ! {
+    crate::diag::bump(&crate::diag::THREAD_EXITS);
     vlog!("shim: ExitThread({code}) on tid {}", unsafe { sys::GetCurrentThreadId() });
     crate::tls::restore_current_thread_array();
     let f: unsafe extern "system" fn(u32) -> ! =
@@ -1119,6 +1483,7 @@ extern "system" fn shim_exit_thread(code: u32) -> ! {
 /// restore, ntdll's thread teardown frees TLS blocks against our array and
 /// corrupts the heap (silent fail-fast a moment later).
 extern "system" fn shim_rtl_exit_user_thread(status: u32) -> ! {
+    crate::diag::bump(&crate::diag::THREAD_EXITS);
     vlog!("shim: RtlExitUserThread({status}) on tid {}", unsafe { sys::GetCurrentThreadId() });
     crate::tls::restore_current_thread_array();
     let f: unsafe extern "system" fn(u32) -> ! =
@@ -1131,6 +1496,7 @@ extern "system" fn shim_rtl_exit_user_process(status: u32) -> ! {
 }
 
 extern "system" fn shim_free_library_and_exit_thread(h: Handle, code: u32) -> ! {
+    crate::diag::bump(&crate::diag::THREAD_EXITS);
     crate::tls::restore_current_thread_array();
     let f: unsafe extern "system" fn(Handle, u32) -> ! =
         unsafe { std::mem::transmute(REAL_FREE_LIBRARY_AND_EXIT_THREAD.load(Ordering::Relaxed)) };
@@ -1151,6 +1517,15 @@ fn dynamic_override(name: &str) -> Option<usize> {
         "ExitThread" if have(&REAL_EXIT_THREAD) => Some(shim_exit_thread as *const () as usize),
         "ExitProcess" if have(&REAL_EXIT_PROCESS) => {
             Some(shim_exit_process as *const () as usize)
+        }
+        "RtlPcToFileHeader" if have(&REAL_RTL_PC_TO_FILE_HEADER) => {
+            Some(shim_rtl_pc_to_file_header as *const () as usize)
+        }
+        "GetModuleHandleExW" if have(&REAL_GET_MODULE_HANDLE_EX_W) => {
+            Some(shim_get_module_handle_ex_w as *const () as usize)
+        }
+        "GetModuleHandleExA" if have(&REAL_GET_MODULE_HANDLE_EX_A) => {
+            Some(shim_get_module_handle_ex_a as *const () as usize)
         }
         _ => None,
     }
@@ -1326,6 +1701,9 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
                 "NtCreateThreadEx" if have(&REAL_NT_CREATE_THREAD_EX) => {
                     cast(shim_nt_create_thread_ex as *const ())
                 }
+                "RtlPcToFileHeader" if have(&REAL_RTL_PC_TO_FILE_HEADER) => {
+                    cast(shim_rtl_pc_to_file_header as *const ())
+                }
                 _ => None,
             },
             ImportName::Ordinal(_) => None,
@@ -1367,6 +1745,24 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
             "GetModuleHandleA" if have(&REAL_GET_MODULE_HANDLE_A) => {
                 cast(shim_get_module_handle_a as *const ())
             }
+            "GetModuleHandleExW" if have(&REAL_GET_MODULE_HANDLE_EX_W) => {
+                cast(shim_get_module_handle_ex_w as *const ())
+            }
+            "GetModuleHandleExA" if have(&REAL_GET_MODULE_HANDLE_EX_A) => {
+                cast(shim_get_module_handle_ex_a as *const ())
+            }
+            "K32EnumProcessModules" if have(&REAL_K32_ENUM_PROCESS_MODULES) => {
+                cast(shim_k32_enum_process_modules as *const ())
+            }
+            "K32GetModuleBaseNameW" if have(&REAL_K32_GET_MODULE_BASE_NAME_W) => {
+                cast(shim_k32_get_module_base_name_w as *const ())
+            }
+            "K32GetModuleFileNameExW" if have(&REAL_K32_GET_MODULE_FILE_NAME_EX_W) => {
+                cast(shim_k32_get_module_file_name_ex_w as *const ())
+            }
+            "VirtualQuery" if have(&REAL_VIRTUAL_QUERY) => {
+                cast(shim_virtual_query as *const ())
+            }
             "FreeLibrary" if have(&REAL_FREE_LIBRARY) => cast(shim_free_library as *const ()),
             "CreateThread" if have(&REAL_CREATE_THREAD) => cast(shim_create_thread as *const ()),
             "GetModuleFileNameW" if have(&REAL_GET_MODULE_FILE_NAME_W) => {
@@ -1395,6 +1791,18 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
             }
             "PostQueuedCompletionStatus" if have(&REAL_POST_QUEUED) => {
                 cast(shim_post_queued_completion as *const ())
+            }
+            "GetNumberOfConsoleInputEvents" if have(&REAL_GET_NUM_CONSOLE_EVENTS) => {
+                cast(shim_get_num_console_input_events as *const ())
+            }
+            "GetQueuedCompletionStatusEx" if have(&REAL_GET_QUEUED_EX) => {
+                cast(shim_get_queued_completion_ex as *const ())
+            }
+            "SetConsoleMode" if have(&REAL_SET_CONSOLE_MODE) => {
+                cast(shim_set_console_mode as *const ())
+            }
+            "ReadConsoleW" if have(&REAL_READ_CONSOLE_W) => {
+                cast(shim_read_console_w as *const ())
             }
             "ExitProcess" if have(&REAL_EXIT_PROCESS) => cast(shim_exit_process as *const ()),
             "ExitThread" if have(&REAL_EXIT_THREAD) => cast(shim_exit_thread as *const ()),
