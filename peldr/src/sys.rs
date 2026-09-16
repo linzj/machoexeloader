@@ -461,3 +461,17 @@ pub fn set_tls_array_for(teb: usize, arr: *mut usize) {
         *((teb + TEB_TLS_ARRAY) as *mut *mut usize) = arr;
     }
 }
+
+const TEB_FLS_DATA: usize = 0x17C8;
+
+/// Pointer to TEB->FlsData (the per-thread FLS record ntdll links into
+/// RtlFlsContext); non-null once an FlsSetValue ran on the thread.
+pub fn fls_data_for(teb: usize) -> usize {
+    unsafe { *((teb + TEB_FLS_DATA) as *const usize) }
+}
+
+pub fn set_fls_data_for(teb: usize, v: usize) {
+    unsafe {
+        *((teb + TEB_FLS_DATA) as *mut usize) = v;
+    }
+}

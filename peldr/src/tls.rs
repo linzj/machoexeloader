@@ -22,10 +22,13 @@
 //! Teardown: ntdll frees TLS arrays and per-module blocks from its private
 //! LdrpTlsHeap, so at thread exit the TEB must not point at our process-heap
 //! array -- one-shot threads get it nulled (ntdll's teardown then skips all
-//! frees), pool threads get ntdll's own array back for reuse.
+//! frees), pool threads get ntdll's own array back for reuse. One-shot
+//! threads run their FLS record through ntdll's own RtlProcessFlsData before
+//! the null: LdrShutdownThread executes FLS callbacks after it, and those
+//! callbacks read thread-locals through the very pointer being nulled.
 
 use std::alloc::{alloc, Layout};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::image::{Image, ImageKind};
 use crate::sys;
@@ -278,36 +281,45 @@ fn attach_for_teb(teb: usize, is_target: bool, reusable: bool) -> Result<(), Str
 /// bookkeeping, so the TEB must point back at the array ntdll created.
 pub fn restore_current_thread_array() {
     let teb = sys::teb();
-    let mut guard = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
     let tid = unsafe { sys::GetCurrentThreadId() };
-    let Some(st) = guard.as_mut() else {
-        vlog!("tls: restore on thread {teb:#x} (tid {tid}) — TLS state absent");
-        return;
-    };
-    let Some(pos) = st
-        .threads
-        .iter()
-        .position(|t| t.teb == teb && t.tid == tid)
-    else {
-        vlog!("tls: restore on untracked thread {teb:#x} (tid {tid}) — no-op");
-        return;
-    };
     let (original, ours, reusable) = {
-        let rec = &st.threads[pos];
-        (rec.original, rec.ours, rec.reusable)
+        let mut guard = match STATE.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(st) = guard.as_mut() else {
+            vlog!("tls: restore on thread {teb:#x} (tid {tid}) — TLS state absent");
+            return;
+        };
+        let Some(pos) = st
+            .threads
+            .iter()
+            .position(|t| t.teb == teb && t.tid == tid)
+        else {
+            vlog!("tls: restore on untracked thread {teb:#x} (tid {tid}) — no-op");
+            return;
+        };
+        let (original, ours, reusable) = {
+            let rec = &st.threads[pos];
+            (rec.original, rec.ours, rec.reusable)
+        };
+        st.threads.remove(pos);
+        (original, ours, reusable)
     };
+    // The lock is dropped before the branches below: the FLS step runs
+    // target callbacks, which may call back into the loader (LoadLibrary ->
+    // on_host_module_load -> STATE).
     if sys::tls_array_for(teb) as usize == ours {
         if reusable {
             // Pool thread: it will run more work; give ntdll its array back.
             sys::set_tls_array_for(teb, original as *mut usize);
             vlog!("tls: thread {teb:#x} (tid {tid}) array restored for reuse");
         } else {
-            // One-shot thread about to die: null the pointer so ntdll's
+            // One-shot thread about to die: process its FLS record while the
+            // array is still installed, then null the pointer so ntdll's
             // thread teardown (LdrpFreeTls) skips all frees -- its private
             // LdrpTlsHeap may only ever free ntdll's own allocations.
+            process_fls_for_exit(teb);
             sys::set_tls_array_for(teb, std::ptr::null_mut());
             vlog!("tls: thread {teb:#x} (tid {tid}) array nulled for exit");
         }
@@ -319,7 +331,45 @@ pub fn restore_current_thread_array() {
             sys::tls_array_for(teb) as usize
         );
     }
-    st.threads.remove(pos);
+}
+
+/// ntdll!RtlProcessFlsData (exported). LdrShutdownThread calls it with
+/// (teb->FlsData, 1) to run a thread's FLS callbacks and unlink the record.
+fn rtl_process_fls_data() -> Option<unsafe extern "system" fn(usize, u32)> {
+    static F: OnceLock<Option<usize>> = OnceLock::new();
+    let p = *F.get_or_init(|| {
+        sys::load_library_a("ntdll.dll")
+            .ok()
+            .and_then(|h| sys::get_proc(h, "RtlProcessFlsData"))
+    });
+    p.map(|p| unsafe { std::mem::transmute(p) })
+}
+
+/// Run the exiting thread's FLS record through ntdll's own processing while
+/// the TLS array is still valid, then clear TEB->FlsData so ntdll's later
+/// LdrShutdownThread pass finds nothing (the record is already unlinked; a
+/// second call would trip its list integrity check). Without this, FLS
+/// callbacks registered by target code run after the array was nulled and
+/// fault reading thread-locals through the NULL pointer.
+fn process_fls_for_exit(teb: usize) {
+    let fls = sys::fls_data_for(teb);
+    if fls == 0 {
+        return;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("PELDR_NO_FLS_EXIT").is_some()) {
+        return;
+    }
+    match rtl_process_fls_data() {
+        Some(f) => {
+            unsafe { f(fls, 1) };
+            sys::set_fls_data_for(teb, 0);
+            vlog!("tls: thread {teb:#x} FLS record {fls:#x} processed before exit");
+        }
+        None => {
+            vlog!("tls: thread {teb:#x} has FLS record {fls:#x} but RtlProcessFlsData is unavailable");
+        }
+    }
 }
 
 /// Called from the LoadLibrary shims after a host module was loaded: ntdll
