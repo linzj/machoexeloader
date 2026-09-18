@@ -67,6 +67,7 @@ peldr [-v] [-e] [-r] <目标> [args...]
 | `GetCommandLineA/W` | 返回伪造的命令行(宿主 kernelbase 按首调缓存,必须自供) |
 | `CreateThread`、`_beginthreadex` | 包装 start routine:新线程先完成 TLS 数组重建 |
 | `RegisterWaitForSingleObject` | 回调跑在 ntdll 线程池线程上(不经 CreateThread),同样先重建 TLS,回调结束归还数组(Bun 的控制台输入读取走这条路) |
+| `QueueUserWorkItem` | 回调同样跑在 ntdll 线程池线程上(Bun 控制台驱动的初始化任务、以及复位窗口期无法重挂等待时的备用读取 dispatcher 走这条路),先重建 TLS、回调结束归还 |
 | `ExitProcess`、`ExitThread`、`TerminateProcess`(自身) | 进程级硬退出(目标 atexit 已跑完)/ 线程退出前处理 TEB TLS 数组 |
 | `RtlExitUserThread`、`RtlExitUserProcess`、`FreeLibraryAndExitThread` | ntdll 的退出入口,含 Bun 经 `GetProcAddress` 动态解析后直接调用的 `RtlExitUserThread`(由 GetProcAddress shim 拦截);退出前把 TEB TLS 数组置空或还原 |
 
@@ -121,6 +122,9 @@ peldr [-v] [-e] [-r] <目标> [args...]
 - **线程池回调线程**:`RegisterWaitForSingleObject` 的回调在 ntdll 线程池线程上执行,
   不经 CreateThread shim(Bun 的 TUI 控制台输入读取就挂在它上面);漏掉包裹会导致
   回调读到加载器的 TLS 块 —— 表现为 TUI 渲染正常但无法输入、卡死。
+  `QueueUserWorkItem` 是同类入口(Bun 控制台驱动的初始化任务、复位窗口期的备用读取
+  dispatcher 都经它投递),同样必须包裹:否则启动期偶发控制台驱动停在
+  `sel=0x2000`、等待未重挂、输入事件积压却永不被读的僵死。
 - **目标线程上的加载器代码禁止使用 Rust std 的 TLS 附带设施**(stdio/panic 展开路径
   内含 thread_local);运行期日志统一走裸 WriteFile(`vlog!`/`rerr!`),panic hook 同样
   裸写。v3 之后目标线程的 Rust TLS 已保持可用,但这层防御保留。

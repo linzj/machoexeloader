@@ -81,6 +81,7 @@ static REAL_K32_ENUM_PROCESS_MODULES: AtomicUsize = AtomicUsize::new(0);
 static REAL_K32_GET_MODULE_BASE_NAME_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_K32_GET_MODULE_FILE_NAME_EX_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_VIRTUAL_QUERY: AtomicUsize = AtomicUsize::new(0);
+static REAL_QUEUE_USER_WORK_ITEM: AtomicUsize = AtomicUsize::new(0);
 static REAL_WRITE_CONSOLE_INPUT_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_WRITE_CONSOLE_W: AtomicUsize = AtomicUsize::new(0);
 static REAL_WRITE_FILE: AtomicUsize = AtomicUsize::new(0);
@@ -126,6 +127,7 @@ pub fn init_reals() {
     set(&REAL_K32_GET_MODULE_BASE_NAME_W, "K32GetModuleBaseNameW");
     set(&REAL_K32_GET_MODULE_FILE_NAME_EX_W, "K32GetModuleFileNameExW");
     set(&REAL_VIRTUAL_QUERY, "VirtualQuery");
+    set(&REAL_QUEUE_USER_WORK_ITEM, "QueueUserWorkItem");
     set(&REAL_WRITE_CONSOLE_INPUT_W, "WriteConsoleInputW");
     set(&REAL_WRITE_CONSOLE_W, "WriteConsoleW");
     set(&REAL_WRITE_FILE, "WriteFile");
@@ -955,6 +957,60 @@ unsafe extern "system" fn waiter_bootstrap(param: *mut c_void, fired: u8) {
     vlog!("shim: waiter tail (tid {}) callback done", unsafe { sys::GetCurrentThreadId() });
     crate::tls::restore_current_thread_array();
     crate::diag::bump(&crate::diag::WAITER_TAILS);
+}
+
+/// QueueUserWorkItem callbacks also run on ntdll thread-pool threads (bun's
+/// console driver queues its read dispatcher this way when the raw wait can't
+/// be re-armed, e.g. inside the terminal-detection reset window). Same TLS
+/// contract as wait callbacks: rebuild the target array before the callback
+/// and hand the thread back afterwards.
+struct WorkStart {
+    cb: usize,
+    ctx: usize,
+}
+
+unsafe extern "system" fn work_bootstrap(param: *mut c_void) -> u32 {
+    crate::diag::bump(&crate::diag::WORK_FIRES);
+    let ws = unsafe { Box::from_raw(param as *mut WorkStart) };
+    vlog!(
+        "shim: queue_user_work fire (cb {:#x}, ctx {:#x}) tid {}",
+        ws.cb,
+        ws.ctx,
+        unsafe { sys::GetCurrentThreadId() }
+    );
+    if let Err(e) = crate::tls::attach_reusable_thread() {
+        crate::rerr!("TLS setup failed on work-item thread: {e}");
+    }
+    crate::tls::run_thread_attach_callbacks();
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(ws.cb) };
+    let rc = unsafe { f(ws.ctx as *mut c_void) };
+    vlog!(
+        "shim: queue_user_work tail (tid {}) rc {rc}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
+    crate::tls::restore_current_thread_array();
+    crate::diag::bump(&crate::diag::WORK_RETS);
+    rc
+}
+
+extern "system" fn shim_queue_user_work_item(cb: usize, ctx: *mut c_void, flags: u32) -> i32 {
+    let f: unsafe extern "system" fn(usize, *mut c_void, u32) -> i32 =
+        unsafe { std::mem::transmute(REAL_QUEUE_USER_WORK_ITEM.load(Ordering::Relaxed)) };
+    crate::diag::bump(&crate::diag::WORK_QUEUED);
+    if cb == 0 || bare_mode() {
+        let rc = unsafe { f(cb, ctx, flags) };
+        if !bare_mode() {
+            vlog!("shim: QueueUserWorkItem(cb {cb:#x}, ctx {ctx:p}, flags {flags:#x}) -> {rc} [direct]");
+        }
+        return rc;
+    }
+    let ws = Box::into_raw(Box::new(WorkStart { cb, ctx: ctx as usize }));
+    let rc = unsafe { f(work_bootstrap as *const () as usize, ws as *mut c_void, flags) };
+    vlog!(
+        "shim: QueueUserWorkItem(cb {cb:#x}, ctx {ctx:p}, flags {flags:#x}) -> {rc} tid {}",
+        unsafe { sys::GetCurrentThreadId() }
+    );
+    rc
 }
 
 extern "system" fn shim_register_wait(
@@ -1876,6 +1932,9 @@ pub fn shim_for(dll: &str, func: &ImportName) -> Option<usize> {
             }
             "VirtualQuery" if have(&REAL_VIRTUAL_QUERY) => {
                 cast(shim_virtual_query as *const ())
+            }
+            "QueueUserWorkItem" if have(&REAL_QUEUE_USER_WORK_ITEM) => {
+                cast(shim_queue_user_work_item as *const ())
             }
             "FreeLibrary" if have(&REAL_FREE_LIBRARY) => cast(shim_free_library as *const ()),
             "CreateThread" if have(&REAL_CREATE_THREAD) => cast(shim_create_thread as *const ()),

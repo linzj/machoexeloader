@@ -26,6 +26,9 @@ pub static CON_EVENTS: AtomicUsize = AtomicUsize::new(0);
 pub static THREAD_EXITS: AtomicUsize = AtomicUsize::new(0);
 pub static HOST_LOADS: AtomicUsize = AtomicUsize::new(0);
 pub static TARGET_LOADS: AtomicUsize = AtomicUsize::new(0);
+pub static WORK_QUEUED: AtomicUsize = AtomicUsize::new(0);
+pub static WORK_FIRES: AtomicUsize = AtomicUsize::new(0);
+pub static WORK_RETS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn bump(c: &AtomicUsize) {
     c.fetch_add(1, Ordering::Relaxed);
@@ -33,7 +36,7 @@ pub fn bump(c: &AtomicUsize) {
 
 pub fn snapshot() -> String {
     format!(
-        "boots {}/{} waiter {}/{} regwait {} gpa {}/{} conread {}/{} exits {} loads host/target {}/{}",
+        "boots {}/{} waiter {}/{} regwait {} gpa {}/{} conread {}/{} exits {} loads host/target {}/{} work {}/{}/{}",
         BOOTS.load(Ordering::Relaxed),
         BOOT_RETS.load(Ordering::Relaxed),
         WAITER_FIRES.load(Ordering::Relaxed),
@@ -46,6 +49,9 @@ pub fn snapshot() -> String {
         THREAD_EXITS.load(Ordering::Relaxed),
         HOST_LOADS.load(Ordering::Relaxed),
         TARGET_LOADS.load(Ordering::Relaxed),
+        WORK_QUEUED.load(Ordering::Relaxed),
+        WORK_FIRES.load(Ordering::Relaxed),
+        WORK_RETS.load(Ordering::Relaxed),
     )
 }
 
