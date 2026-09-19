@@ -8,3 +8,5 @@
 /elldr/target
 /elldr/tests/out
 /elldr/tmp
+/experiments/*/out
+/experiments/**/*.obj

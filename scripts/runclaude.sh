@@ -1,7 +1,7 @@
 #!/bin/sh
 # 经用户态加载器启动 claude 原生二进制:
 #   macOS  -> mldr  (darwin-arm64)
-#   Windows Git Bash -> peldr (win32-x64)
+#   Windows Git Bash -> pldr (win32-x64, 零 shim;RUNCLAUDE_LEGACY=1 用 peldr 旧 shim 模式)
 #   Linux  -> elldr (linux-x64)
 # 环境/flags 对齐 ~/.local/bin/claude-node:
 #   DISABLE_AUTOUPDATER=1、本机代理、--setting-sources project,local
@@ -16,6 +16,7 @@
 # 用法:
 #   runclaude.sh [claude args...]   启动(未安装时提示先跑 install)
 #   runclaude.sh install            下载官方最新版并校验安装(macOS 走 installer;Windows 直接替换二进制)
+#   RUNCLAUDE_LEGACY=1 runclaude.sh ...   Windows 专用: 用 peldr(旧 shim 模式)代替 pldr
 set -u
 
 # 防注入继承:实测 claude 的 Bun 运行时会执行 BUN_OPTIONS 里的 --preload
@@ -50,9 +51,16 @@ case "$(uname -s)" in
     PLATFORM=win32-x64
     BIN=claude.exe
     CLAUDE=$HOME/.local/bin/claude.exe
-    LOADER_REL=peldr/target/release/peldr.exe
-    LOADER_NAME=peldr.exe
-    BUILD_HINT="cargo build --release(在 peldr/ 目录)"
+    # 默认 pldr(零 shim 加载器);RUNCLAUDE_LEGACY=1 切回 peldr(旧 shim 模式)
+    if [ -n "${RUNCLAUDE_LEGACY:-}" ]; then
+      LOADER_REL=peldr/target/release/peldr.exe
+      LOADER_NAME=peldr.exe
+      BUILD_HINT="cargo build --release(在 peldr/ 目录)"
+    else
+      LOADER_REL=experiments/pldr/out/pldr.exe
+      LOADER_NAME=pldr.exe
+      BUILD_HINT="bash build.sh(在 experiments/pldr/ 目录)"
+    fi
     ;;
   Linux)
     case "$(uname -m)" in
@@ -73,11 +81,32 @@ case "$(uname -s)" in
 esac
 
 # ---- 定位加载器: RUNCLAUDE_LOADER > 脚本所在仓库 ------------------------------
+LOADER=
+for cand in "${RUNCLAUDE_LOADER:-}" "$ROOT/$LOADER_REL"; do
+  if [ -n "$cand" ] && [ -f "$cand" ]; then
+    LOADER=$cand
+    break
+  fi
+done
+if [ -z "$LOADER" ]; then
+  echo "未找到加载器 $LOADER_NAME" >&2
+  echo "  已查找: RUNCLAUDE_LOADER、$ROOT/$LOADER_REL" >&2
+  echo "  请先构建或设置 RUNCLAUDE_LOADER:$BUILD_HINT" >&2
+  if [ "$PLATFORM" = win32-x64 ] && [ -z "${RUNCLAUDE_LEGACY:-}" ]; then
+    echo "  或设 RUNCLAUDE_LEGACY=1 改用 peldr(旧 shim 模式)" >&2
+  fi
+  exit 1
+fi
+
 # 排查用: RUNCLAUDE_VERBOSE=1 让加载器带 -v 输出;未显式指定日志变量时
 # 日志默认落 $HOME/elldr.log(elldr)或 $HOME/peldr.log(peldr),避免污染 TUI
+# pldr 无 -v 标志,其诊断输出直接走 stderr(按实际命中的加载器判定)
 LOADER_FLAGS=
 if [ -n "${RUNCLAUDE_VERBOSE:-}" ]; then
-  LOADER_FLAGS=-v
+  case "$(basename "$LOADER")" in
+    pldr.exe) echo "注意: pldr 无 -v 标志,RUNCLAUDE_VERBOSE 仅保留日志变量设置" >&2 ;;
+    *) LOADER_FLAGS=-v ;;
+  esac
   case "$PLATFORM" in
     linux-x64)
       if [ -z "${ELLDR_LOG:-}" ]; then
@@ -93,19 +122,16 @@ if [ -n "${RUNCLAUDE_VERBOSE:-}" ]; then
       ;;
   esac
 fi
-LOADER=
-for cand in "${RUNCLAUDE_LOADER:-}" "$ROOT/$LOADER_REL"; do
-  if [ -n "$cand" ] && [ -f "$cand" ]; then
-    LOADER=$cand
-    break
-  fi
-done
-if [ -z "$LOADER" ]; then
-  echo "未找到加载器 $LOADER_NAME" >&2
-  echo "  已查找: RUNCLAUDE_LOADER、$ROOT/$LOADER_REL" >&2
-  echo "  请先构建或设置 RUNCLAUDE_LOADER:$BUILD_HINT" >&2
-  exit 1
-fi
+
+# MSYS2 实测不会对 pldr.exe(仅导入 ntdll 的极简 PE)做 POSIX->Win32 参数路径转换,
+# 目标路径需手动转成 Windows 形式;peldr 等普通原生 exe 由 MSYS2 自动转换
+CLAUDE_ARG=$CLAUDE
+case "$(basename "$LOADER")" in
+  pldr.exe)
+    CLAUDE_ARG=$(cygpath -w "$CLAUDE" 2>/dev/null)
+    [ -n "$CLAUDE_ARG" ] || CLAUDE_ARG=$CLAUDE
+    ;;
+esac
 
 STATUSLINE=$HOME/.claude/statusline-command.sh
 BASE_URL=https://downloads.claude.ai/claude-code-releases
@@ -225,7 +251,7 @@ do_install() {
     chmod +x "$CLAUDE"
   fi
   echo "==> 经加载器校验安装结果..."
-  if ! "$LOADER" "$CLAUDE" --version; then
+  if ! "$LOADER" "$CLAUDE_ARG" --version; then
     if [ -e "$CLAUDE.bak" ]; then
       echo "校验失败,回滚" >&2
       cp -f "$CLAUDE.bak" "$CLAUDE"
@@ -265,7 +291,7 @@ if [ -n "$hook_summary" ]; then
   fi
 fi
 
-exec "$LOADER" $LOADER_FLAGS "$CLAUDE" \
+exec "$LOADER" $LOADER_FLAGS "$CLAUDE_ARG" \
   --settings "$settings_arg" \
   --setting-sources project,local \
   --dangerously-skip-permissions "$@"
