@@ -23,7 +23,10 @@ PLDR_WAKE_DELAY_MS=20         # 控制台唤醒延迟;0=关闭
    TLS 目录，目标 `_tls_index` 写 0，主线程块 memcpy 目标模板并手动跑一次回调。
    之后每个新线程（含线程池）的 TLS 由 ntdll 原生分配初始化，拆卸也原生安全。
    `LdrpTlsList` 定位：扫 `LdrpAllocateTlsEntry` 的 prologue 特征码（arg-home
-   三连 + rbx/rsi/rdi push，.text 内唯一）→ 其第一条落在可写节的 lea rcx,[rip+x]。
+   三连 + rbx/rsi/rdi push）→ 其第一条落在可写节的 lea rcx,[rip+x]。该特征码
+   在 .text 内并不唯一（22621 上 RtlQueryEnvironmentVariable 同形），所以逐个
+   候选验证：受限步数 + NtQueryVirtualMemory 探针地遍历链表，找到我们自己的
+   entry 才算命中，否则试下一个。
    不以 `LdrpHandleTlsData` 为锚点：它的 prologue 随编译器漂移（22621 是 r11
    帧，20348 变成 rsp spill，旧特征码在 20348 上反而命中另一个函数），而
    `LdrpAllocateTlsEntry` 的 prologue 与该 lea 在两个版本上逐字节一致。

@@ -70,6 +70,7 @@ NTSYSAPI NTSTATUS NTAPI NtReadFile(HANDLE, HANDLE, void *, void *, IO_STATUS_BLO
 NTSYSAPI NTSTATUS NTAPI NtClose(HANDLE);
 NTSYSAPI NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE, void **, u64, u64 *, u32, u32);
 NTSYSAPI NTSTATUS NTAPI NtQueryInformationFile(HANDLE, IO_STATUS_BLOCK *, void *, u32, u32);
+NTSYSAPI NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, void *, int, void *, u64, u64 *);
 NTSYSAPI NTSTATUS NTAPI NtWriteFile(HANDLE, HANDLE, void *, void *, IO_STATUS_BLOCK *, void *, u32, i64 *, u32 *);
 NTSYSAPI NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 NTSYSAPI void *NTAPI RtlAllocateHeap(void *, u32, u64);
@@ -180,31 +181,12 @@ static u64 find_ntdll(void) {
 // callee-saved pushes. Anchoring here instead of LdrpHandleTlsData: that
 // function's prologue is compiler-shaped (r11-based frame on 22621, plain
 // rsp spills on 20348), while this prologue and the lea below are identical
-// on both, and it is unique in .text (previous byte is int3 padding).
+// on both. NOTE: the pattern is NOT unique in .text (RtlQueryEnvironmentVariable
+// shares it on 22621), so matches are validated by actually list-walking for
+// our own entry (see find_our_tls_entry).
 static const u8 PROL[] = {0x4c, 0x89, 0x4c, 0x24, 0x20, 0x4c, 0x89, 0x44,
                           0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x53,
                           0x56, 0x57};
-
-static u64 find_alloc_entry(u64 base) {
-    u64 nt = base + *(u32 *)(base + 0x3C);
-    u16 nsec = *(u16 *)(nt + 6);
-    u64 secs = nt + 24 + *(u16 *)(nt + 20);
-    for (u16 i = 0; i < nsec; i++) {
-        u64 s = secs + i * 40;
-        const u8 *nm = (const u8 *)s;
-        if (!(nm[0] == '.' && nm[1] == 't' && nm[2] == 'e')) continue;
-        u32 vs = *(u32 *)(s + 8);
-        u64 va = base + *(u32 *)(s + 12);
-        for (u64 o = 0; o + sizeof(PROL) + 0x180 < vs; o++) {
-            const u8 *p = (const u8 *)(va + o);
-            u64 j = 0;
-            for (; j < sizeof(PROL); j++)
-                if (p[j] != PROL[j]) break;
-            if (j == sizeof(PROL)) return (u64)p;
-        }
-    }
-    return 0;
-}
 
 static int in_writable(u64 base, u64 nt, u64 tgt) {
     u16 nsec = *(u16 *)(nt + 6);
@@ -228,6 +210,58 @@ static u64 find_ldrp_tls_list(u64 base, u64 fn) {
         if (r[0] == 0x48 && r[1] == 0x8D && r[2] == 0x0D) {
             u64 tgt = (u64)(r + 7) + (i64)(*(i32 *)(r + 3));
             if (in_writable(base, nt, tgt)) return tgt;
+        }
+    }
+    return 0;
+}
+
+// Is [p, p+n) readable committed memory? Guards the candidate list walk
+// against garbage pointers from a wrong PROL match.
+static int readable(u64 p, u64 n) {
+    u8 mbi[48];
+    u64 ret = 0;
+    if (NtQueryVirtualMemory((HANDLE)-1, (void *)p, 0, mbi, sizeof(mbi), &ret) < 0) return 0;
+    u32 state = *(u32 *)(mbi + 32);
+    u32 prot = *(u32 *)(mbi + 36);
+    if (state != 0x1000) return 0;  // MEM_COMMIT
+    if (prot & 0x101) return 0;     // NOACCESS / GUARD
+    if (!(prot & 0xEE)) return 0;   // has some read bit
+    return n > 1 ? readable(p + n - 1, 1) : 1;
+}
+
+// Bounded, probe-checked walk of an LdrpTlsList candidate, looking for our
+// own entry (its +0x20 is &_tls_index). Returns 0 on any inconsistency.
+static u64 tls_list_find_ours(u64 tlsp) {
+    if (!tlsp || !readable(tlsp, 16)) return 0;
+    u64 e = *(u64 *)tlsp;
+    for (int steps = 0; e && e != tlsp && steps < 64; steps++) {
+        if (!readable(e, 0x28)) return 0;
+        if (*(u64 *)(e + 0x20) == (u64)&_tls_index) return e;
+        e = *(u64 *)e;
+    }
+    return 0;
+}
+
+// Try every PROL hit in .text; accept the first whose writable lea decodes
+// to a list that actually contains our TLS entry.
+static u64 find_our_tls_entry(u64 base) {
+    u64 nt = base + *(u32 *)(base + 0x3C);
+    u16 nsec = *(u16 *)(nt + 6);
+    u64 secs = nt + 24 + *(u16 *)(nt + 20);
+    for (u16 i = 0; i < nsec; i++) {
+        u64 s = secs + i * 40;
+        const u8 *nm = (const u8 *)s;
+        if (!(nm[0] == '.' && nm[1] == 't' && nm[2] == 'e')) continue;
+        u32 vs = *(u32 *)(s + 8);
+        u64 va = base + *(u32 *)(s + 12);
+        for (u64 o = 0; o + sizeof(PROL) + 0x180 < vs; o++) {
+            const u8 *p = (const u8 *)(va + o);
+            u64 j = 0;
+            for (; j < sizeof(PROL); j++)
+                if (p[j] != PROL[j]) break;
+            if (j < sizeof(PROL)) continue;
+            u64 e = tls_list_find_ours(find_ldrp_tls_list(base, va + o));
+            if (e) return e;
         }
     }
     return 0;
@@ -488,17 +522,7 @@ static void graft_tls(u64 base, u32 tls_rva) {
     if (!tls_rva) return;
     u64 ntdll = find_ntdll();
     if (!ntdll) die("ntdll base", 8);
-    u64 alloc = find_alloc_entry(ntdll);
-    if (!alloc) die("LdrpAllocateTlsEntry not found", 9);
-    u64 tlsp = find_ldrp_tls_list(ntdll, alloc);
-    if (!tlsp) die("LdrpTlsList not found", 10);
-    u64 our = 0;
-    for (u64 e = *(u64 *)tlsp; e && e != tlsp; e = *(u64 *)e) {
-        if (*(u64 *)(e + 0x20) == (u64)&_tls_index) {
-            our = e;
-            break;
-        }
-    }
+    u64 our = find_our_tls_entry(ntdll);
     if (!our) die("own TLS entry not found", 11);
     u64 tlsdir = base + tls_rva;
     u64 tstart = *(u64 *)(tlsdir + 0);
