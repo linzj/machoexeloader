@@ -22,8 +22,11 @@ PLDR_WAKE_DELAY_MS=20         # 控制台唤醒延迟;0=关闭
    加载目标后改写自己在 `LdrpTlsList` 里 entry 的模板指针/回调/大小指向目标的
    TLS 目录，目标 `_tls_index` 写 0，主线程块 memcpy 目标模板并手动跑一次回调。
    之后每个新线程（含线程池）的 TLS 由 ntdll 原生分配初始化，拆卸也原生安全。
-   `LdrpTlsList` 定位：`LdrpHandleTlsData` 特征码 → 顺 E8 call 找
-   `LdrpAllocateTlsEntry`（prologue 匹配）→ 其第一条 lea rcx,[rip+x]。
+   `LdrpTlsList` 定位：扫 `LdrpAllocateTlsEntry` 的 prologue 特征码（arg-home
+   三连 + rbx/rsi/rdi push，.text 内唯一）→ 其第一条落在可写节的 lea rcx,[rip+x]。
+   不以 `LdrpHandleTlsData` 为锚点：它的 prologue 随编译器漂移（22621 是 r11
+   帧，20348 变成 rsp spill，旧特征码在 20348 上反而命中另一个函数），而
+   `LdrpAllocateTlsEntry` 的 prologue 与该 lea 在两个版本上逐字节一致。
 3. PEB 补丁（ImageBaseAddress/CommandLine/ImagePathName/LDR 首条目名）要在任何
    宿主 DLL 代码跑之前完成：kernelbase 在进程初始化时就快照命令行，
    `GetCommandLineW/A` 首指令 `48 8B 05 <rel32>` 直接读 `BaseUnicodeCommandLine`
@@ -48,7 +51,7 @@ PLDR_WAKE_DELAY_MS=20         # 控制台唤醒延迟;0=关闭
 
 - 运行时 LoadLibrary 旁的用户 DLL / 插件从 EXE 导符号：不支持（claude.exe 单文件
   用不到）。
-- 特征码只在本机 Win11 22621 回归过。
+- 特征码在 Win11 22621 与 Server 2022（20348.5020）上回归过。
 - `conprobe.c`+`build_probe.sh`：控制台等待/线程池派发探针（排障用）。
 
 `../tlsprobe/` 是更早的机制验证探针（LdrpHandleTlsData、嫁接可行性等）。

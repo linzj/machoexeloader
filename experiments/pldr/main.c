@@ -176,61 +176,58 @@ static u64 find_ntdll(void) {
 
 // ------------------------------------------- ntdll internals (signatures)
 
-// Win11 22621 ntdll!LdrpHandleTlsData prologue + security-cookie reference.
-static const u8 SIG[] = {0x4c, 0x8b, 0xdc, 0x49, 0x89, 0x5b, 0x10, 0x49,
-                         0x89, 0x73, 0x18, 0x57, 0x41, 0x54, 0x41, 0x55,
-                         0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xec, 0x00,
-                         0x01, 0x00, 0x00};
-static const u8 SIG2[] = {0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x48, 0x33, 0xc4,
-                          0x48, 0x89, 0x84, 0x24, 0xf0, 0x00, 0x00, 0x00,
-                          0x48, 0x8b, 0xf9};
-static const u8 SIG2_MASK[] = {1, 1, 1, 0, 0, 0, 0, 1, 1, 1,
-                               1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+// LdrpAllocateTlsEntry prologue: the three arg-home spills plus the
+// callee-saved pushes. Anchoring here instead of LdrpHandleTlsData: that
+// function's prologue is compiler-shaped (r11-based frame on 22621, plain
+// rsp spills on 20348), while this prologue and the lea below are identical
+// on both, and it is unique in .text (previous byte is int3 padding).
+static const u8 PROL[] = {0x4c, 0x89, 0x4c, 0x24, 0x20, 0x4c, 0x89, 0x44,
+                          0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x53,
+                          0x56, 0x57};
 
-static u64 scan_text(u64 base, const u8 *sig, u32 siglen, const u8 *sig2, const u8 *mask, u32 sig2len) {
+static u64 find_alloc_entry(u64 base) {
     u64 nt = base + *(u32 *)(base + 0x3C);
-    u64 opt = nt + 24;
     u16 nsec = *(u16 *)(nt + 6);
-    u64 secs = opt + *(u16 *)(nt + 20);
+    u64 secs = nt + 24 + *(u16 *)(nt + 20);
     for (u16 i = 0; i < nsec; i++) {
         u64 s = secs + i * 40;
         const u8 *nm = (const u8 *)s;
         if (!(nm[0] == '.' && nm[1] == 't' && nm[2] == 'e')) continue;
         u32 vs = *(u32 *)(s + 8);
         u64 va = base + *(u32 *)(s + 12);
-        for (u64 o = 0; o + siglen + sig2len < vs; o++) {
+        for (u64 o = 0; o + sizeof(PROL) + 0x180 < vs; o++) {
             const u8 *p = (const u8 *)(va + o);
             u64 j = 0;
-            for (; j < siglen; j++)
-                if (p[j] != sig[j]) break;
-            if (j < siglen) continue;
-            const u8 *q = p + siglen;
-            for (j = 0; j < sig2len; j++)
-                if (mask[j] && q[j] != sig2[j]) break;
-            if (j == sig2len) return (u64)p;
+            for (; j < sizeof(PROL); j++)
+                if (p[j] != PROL[j]) break;
+            if (j == sizeof(PROL)) return (u64)p;
         }
     }
     return 0;
 }
 
-// Follow the call from LdrpHandleTlsData to LdrpAllocateTlsEntry (matched by
-// prologue), then decode its first `lea rcx,[rip+x]` -> LdrpTlsList.
-static u64 find_ldrp_tls_list(u64 fn) {
-    static const u8 PROL[] = {0x4c, 0x89, 0x4c, 0x24, 0x20, 0x4c, 0x89, 0x44,
-                              0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x53,
-                              0x56, 0x57};
-    for (u64 o = 0; o < 0x600; o++) {
-        const u8 *p = (const u8 *)(fn + o);
-        if (*p != 0xE8) continue;
-        u64 callee = (u64)(p + 5) + (i64)(*(i32 *)(p + 1));
-        u64 j = 0;
-        for (; j < sizeof(PROL); j++)
-            if (*(const u8 *)(callee + j) != PROL[j]) break;
-        if (j < sizeof(PROL)) continue;
-        for (u64 q = 0; q < 0x180; q++) {
-            const u8 *r = (const u8 *)(callee + q);
-            if (r[0] == 0x48 && r[1] == 0x8D && r[2] == 0x0D)
-                return (u64)(r + 7) + (i64)(*(i32 *)(r + 3));
+static int in_writable(u64 base, u64 nt, u64 tgt) {
+    u16 nsec = *(u16 *)(nt + 6);
+    u64 secs = nt + 24 + *(u16 *)(nt + 20);
+    for (u16 i = 0; i < nsec; i++) {
+        u64 s = secs + i * 40;
+        u64 va = base + *(u32 *)(s + 12);
+        if (tgt >= va && tgt < va + *(u32 *)(s + 8))
+            return (*(u32 *)(s + 36) & 0x80000000) != 0; // SCN_MEM_WRITE
+    }
+    return 0;
+}
+
+// LdrpAllocateTlsEntry's first `lea rcx,[rip+x]` loads &LdrpTlsList, which
+// lives in a writable section; earlier rip-relative leas (e.g. to .rdata
+// strings) are skipped.
+static u64 find_ldrp_tls_list(u64 base, u64 fn) {
+    u64 nt = base + *(u32 *)(base + 0x3C);
+    for (u64 q = sizeof(PROL); q + 7 < 0x180; q++) {
+        const u8 *r = (const u8 *)(fn + q);
+        if (r[0] == 0x48 && r[1] == 0x8D && r[2] == 0x0D) {
+            u64 tgt = (u64)(r + 7) + (i64)(*(i32 *)(r + 3));
+            if (in_writable(base, nt, tgt)) return tgt;
         }
     }
     return 0;
@@ -491,9 +488,9 @@ static void graft_tls(u64 base, u32 tls_rva) {
     if (!tls_rva) return;
     u64 ntdll = find_ntdll();
     if (!ntdll) die("ntdll base", 8);
-    u64 fn = scan_text(ntdll, SIG, sizeof(SIG), SIG2, SIG2_MASK, sizeof(SIG2));
-    if (!fn) die("LdrpHandleTlsData not found", 9);
-    u64 tlsp = find_ldrp_tls_list(fn);
+    u64 alloc = find_alloc_entry(ntdll);
+    if (!alloc) die("LdrpAllocateTlsEntry not found", 9);
+    u64 tlsp = find_ldrp_tls_list(ntdll, alloc);
     if (!tlsp) die("LdrpTlsList not found", 10);
     u64 our = 0;
     for (u64 e = *(u64 *)tlsp; e && e != tlsp; e = *(u64 *)e) {
