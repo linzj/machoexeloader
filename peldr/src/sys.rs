@@ -93,6 +93,7 @@ unsafe extern "system" {
 
     pub fn GetCurrentProcessId() -> u32;
     pub fn GetCurrentProcess() -> Handle;
+    pub fn GetSystemInfo(lpSystemInfo: *mut SystemInfo);
     pub fn CloseHandle(hObject: Handle) -> i32;
     pub fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> Handle;
     pub fn Thread32First(hSnapshot: Handle, lpte: *mut ThreadEntry32) -> i32;
@@ -224,8 +225,32 @@ pub struct ExceptionPointers {
     pub context_record: *mut c_void,
 }
 
+#[repr(C)]
+pub struct SystemInfo {
+    pub processor_architecture: u16,
+    pub _reserved: u16,
+    pub page_size: u32,
+    pub min_app_addr: *mut c_void,
+    pub max_app_addr: *mut c_void,
+    pub active_processor_mask: usize,
+    pub number_of_processors: u32,
+    pub processor_type: u32,
+    pub allocation_granularity: u32,
+    pub processor_level: u16,
+    pub processor_revision: u16,
+}
+
 pub fn page_size() -> usize {
-    4096
+    static PAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let cached = PAGE.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let mut si: SystemInfo = unsafe { std::mem::zeroed() };
+    unsafe { GetSystemInfo(&mut si) };
+    let p = if si.page_size == 0 { 4096 } else { si.page_size as usize };
+    PAGE.store(p, std::sync::atomic::Ordering::Relaxed);
+    p
 }
 
 /// Hard process exit: the target's own exit()/atexit handlers have already
@@ -323,9 +348,11 @@ pub fn protect_get(addr: usize, len: usize, prot: u32) -> Result<u32, String> {
     Ok(old)
 }
 
-pub fn release(addr: usize, len: usize) {
+/// Release a whole reservation. MEM_RELEASE requires dwSize = 0 and the
+/// region's base address; passing a nonzero size fails silently.
+pub fn release(addr: usize) {
     unsafe {
-        VirtualFree(addr as *mut c_void, len, MEM_RELEASE);
+        VirtualFree(addr as *mut c_void, 0, MEM_RELEASE);
     }
 }
 

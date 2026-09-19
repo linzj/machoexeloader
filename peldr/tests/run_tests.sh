@@ -4,11 +4,26 @@
 set -u
 cd "$(dirname "$0")/.."
 
-MSVC='C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.40.33807'
-SDK='C:\Program Files (x86)\Windows Kits\10'
-export INCLUDE="$MSVC\\include;$SDK\\Include\\10.0.20348.0\\ucrt;$SDK\\Include\\10.0.20348.0\\um;$SDK\\Include\\10.0.20348.0\\shared"
-export LIB="$MSVC\\lib\\x64;$SDK\\Lib\\10.0.20348.0\\ucrt\\x64;$SDK\\Lib\\10.0.20348.0\\um\\x64"
-CL='/c/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.40.33807/bin/HostX64/x64/cl.exe'
+winpath() { sed -e 's|^/\([a-zA-Z]\)/|\U\1:/|' -e 's|/|\\|g' <<<"$1"; }
+
+# Toolchain: newest installed VS2022 MSVC toolset + Windows SDK (any edition).
+# Override with PELDR_MSVC_VER / PELDR_SDK_VER when detection picks wrong.
+VS_MSVC=''
+for d in '/c/Program Files/Microsoft Visual Studio/2022/'*/VC/Tools/MSVC; do
+    [ -d "$d" ] && { VS_MSVC=$d; break; }
+done
+MSVC_VER=${PELDR_MSVC_VER:-$(ls "$VS_MSVC" 2>/dev/null | sort -V | tail -1)}
+SDK_ROOT='/c/Program Files (x86)/Windows Kits/10'
+SDK_VER=${PELDR_SDK_VER:-$(ls "$SDK_ROOT/Include" 2>/dev/null | grep '^10\.' | sort -V | tail -1)}
+if [ -z "$MSVC_VER" ] || [ -z "$SDK_VER" ]; then
+    echo "MSVC toolset or Windows SDK not found; set PELDR_MSVC_VER / PELDR_SDK_VER"
+    exit 1
+fi
+MSVC="$(winpath "$VS_MSVC")\\$MSVC_VER"
+SDK="$(winpath "$SDK_ROOT")"
+export INCLUDE="$MSVC\\include;$SDK\\Include\\$SDK_VER\\ucrt;$SDK\\Include\\$SDK_VER\\um;$SDK\\Include\\$SDK_VER\\shared"
+export LIB="$MSVC\\lib\\x64;$SDK\\Lib\\$SDK_VER\\ucrt\\x64;$SDK\\Lib\\$SDK_VER\\um\\x64"
+CL="$VS_MSVC/$MSVC_VER/bin/HostX64/x64/cl.exe"
 PELDR=./target/debug/peldr.exe
 export HTTPS_PROXY=http://127.0.0.1:7899
 export HTTP_PROXY=http://127.0.0.1:7899
@@ -34,6 +49,8 @@ cc() { MSYS_NO_PATHCONV=1 "$CL" /nologo /Od "$@" 2>&1; }
     cc -LD ../targets/greet.c suffix.lib || exit 1
     cc ../targets/greettest.c greet.lib || exit 1
     cc ../targets/greettest_delay.c greet.lib delayimp.lib /link /DELAYLOAD:greet.dll || exit 1
+    cc -LD ../targets/tlsdll.c || exit 1
+    cc ../targets/tlsdlltest.c || exit 1
 ) || { echo "target build failed"; exit 1; }
 
 # Run one case natively and through peldr with identical argument strings.
@@ -78,6 +95,7 @@ run_case exitthread
 run_case modname
 run_case greettest
 run_case greettest_delay
+run_case tlsdlltest
 
 # Forced relocation: same outputs, all images loaded away from ImageBase.
 PELDR_WIN='target\debug\peldr.exe -r'

@@ -79,7 +79,7 @@ impl Image {
             Some(p) if p as usize == preferred => (preferred, false),
             Some(p) => {
                 // VirtualAlloc rounded somewhere else; drop it and pick freely.
-                sys::release(p as usize, span);
+                sys::release(p as usize);
                 (0, true)
             }
             None => (0, true),
@@ -107,6 +107,16 @@ impl Image {
     }
 
     fn map_at(pe: Pe, kind: ImageKind, name: String, base: usize) -> Result<Image, String> {
+        // On failure the caller abandons the load, but the reservation is
+        // real address space: never hand back a half-mapped image.
+        let r = Self::map_at_inner(pe, kind, name, base);
+        if r.is_err() {
+            sys::release(base);
+        }
+        r
+    }
+
+    fn map_at_inner(pe: Pe, kind: ImageKind, name: String, base: usize) -> Result<Image, String> {
         let span = pe.size_of_image as usize;
         let page = sys::page_size();
         let preferred = pe.image_base as usize;

@@ -447,7 +447,7 @@ unsafe fn install_ldr_entry(
         let init_head = ldr + 0x30;
 
         let e = match core::alloc::Layout::from_size_align(std::mem::size_of::<LdrEntry>(), 16) {
-            Ok(l) => unsafe { std::alloc::alloc(l) as *mut LdrEntry },
+            Ok(l) => std::alloc::alloc(l) as *mut LdrEntry,
             Err(_) => std::ptr::null_mut(),
         };
         if e.is_null() {

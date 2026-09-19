@@ -53,7 +53,7 @@ peldr [-v] [-e] [-r] <目标> [args...]
     exit 码(目标 CRT 会自己 exit()/ExitProcess,加载器对其做硬退出)
 
  9. 运行时自映射(shim.rs):目标在运行时 LoadLibrary* 一个目标旁的用户 DLL 时,
-    现场完成第 2~4、6 步(延迟加载就是走这条路)
+    现场完成第 2~6 步并调用 DllMain(DLL_PROCESS_ATTACH)(延迟加载就是走这条路)
 ```
 
 ## 注入到目标 IAT 的 shim 表（对应 mldr 的 shim_lookup）
@@ -118,7 +118,8 @@ peldr [-v] [-e] [-r] <目标> [args...]
 - **`.pdata` 必须 RtlAddFunctionTable**(78,997 条实测);JSC/Bun 的 VEH 走 kernel32
   导入天然可用;目标无 CFG(实测 DllCharacteristics 无 GUARD_CF)。
 - **运行时自映射**:延迟加载/dynamic load 在运行时找目标旁的用户 DLL,现场解析+映射
-  +绑定+注册 unwind(等价 load 期逻辑),宿主搜索路径完全不同的问题由此消除。
+  +绑定+注册 unwind+TLS(slot 分配、每线程块重建、callbacks)+DllMain(等价 load 期
+  逻辑),宿主搜索路径完全不同的问题由此消除。
 - **线程池回调线程**:`RegisterWaitForSingleObject` 的回调在 ntdll 线程池线程上执行,
   不经 CreateThread shim(Bun 的 TUI 控制台输入读取就挂在它上面);漏掉包裹会导致
   回调读到加载器的 TLS 块 —— 表现为 TUI 渲染正常但无法输入、卡死。
@@ -146,6 +147,8 @@ cd peldr && ./tests/run_tests.sh
 - `modname` — PEB 伪造(`GetModuleFileNameW`/`GetModuleHandleW`/argv)
 - `greettest` — 依赖链:main → greet.dll → suffix.dll(自映射、跨模块 IAT)
 - `greettest_delay` — `/DELAYLOAD:greet.dll`(运行时自映射路径)
+- `tlsdlltest` — 运行时 `LoadLibrary` 的 DLL 带模块 TLS(`__declspec(thread)` + TLS
+  callback;运行时 TLS 注册:slot 分配、已有/新建线程的块重建、回调)
 - 其中 `greettest`/`hello` 另跑 `-r` 强制重定位版本
 - `claude-load-only` / `claude-exec-version` / `claude-exec-help` /
   `claude-exec-version-rebased` — 对 Claude Code 的 227MB win32-x64 原生二进制
@@ -171,7 +174,6 @@ node tools/pe-disasm.cjs tmp/.../claude.exe b79bef 100
 ## 已知限制
 
 - 仅支持 x86_64 PE;目标是 EXE(依赖 DLL 可以是任意 PE DLL)
-- 运行时自映射的 DLL 若带模块 TLS 目录会告警且不保证可用(加载期的自映射 DLL 支持)
 - 不做 CFG 注册(实测目标无 CFG;若遇到 /guard:cf 目标需补 SetProcessValidCallTargets)
 - 不做 FreeLibrary 引用计数/卸载;内存峰值约 500MB(227MB 文件 + 219MB 镜像),与 mldr 同级
 - 目标是 GUI 子系统程序时可用但控制台交互按目标自身行为

@@ -151,12 +151,13 @@ pub fn initialize(images: &[Image]) -> Result<(), String> {
         }
         infos.push((img, t, block_size));
     }
-    if infos.is_empty() {
-        return Ok(());
-    }
     let base = count_host_tls_modules();
     let loader_index_addr = loader_tls_index_addr().unwrap_or(0);
     let mut next_dll_slot = base + 1;
+    // STATE must exist even when no load-time image has TLS: a runtime
+    // self-mapped DLL with a TLS directory registers into it later, and
+    // silently no-op'ing there leaves such a DLL's _tls_index pointing at
+    // slot 0 (someone else's block).
     vlog!(
         "tls: {} mapped image(s) with TLS, host TLS modules {base}, loader slot {base}",
         infos.len()
@@ -531,19 +532,30 @@ pub fn register_runtime_image(img: &Image) -> Result<(), String> {
         rec.ours = ours;
         sys::set_tls_array_for(rec.teb, ours as *mut usize);
     }
-    // Module TLS callbacks, DLL_PROCESS_ATTACH with lpReserved=0 (dynamic load).
-    if let Some(a) = si.callbacks_addr {
+    // Module TLS callbacks, DLL_PROCESS_ATTACH with lpReserved=0 (dynamic
+    // load). Collected under the lock, run outside it (same discipline as
+    // run_thread_attach_callbacks): a callback may re-enter LoadLibrary or
+    // CreateThread and thus the TLS machinery, and STATE is not reentrant.
+    let cbs: Vec<usize> = if let Some(a) = si.callbacks_addr {
+        let mut v = Vec::new();
         let mut i = 0usize;
         loop {
             let f = unsafe { *((a + i * 8) as *const usize) };
             if f == 0 || i > 128 {
                 break;
             }
-            vlog!("tls: running runtime callback {f:#x} for image at {:#x}", img.base);
-            let cb: unsafe extern "system" fn(usize, u32, usize) = unsafe { std::mem::transmute(f) };
-            unsafe { cb(img.base, 1, 0) };
+            v.push(f);
             i += 1;
         }
+        v
+    } else {
+        Vec::new()
+    };
+    drop(guard);
+    for f in cbs {
+        vlog!("tls: running runtime callback {f:#x} for image at {:#x}", img.base);
+        let cb: unsafe extern "system" fn(usize, u32, usize) = unsafe { std::mem::transmute(f) };
+        unsafe { cb(img.base, 1, 0) };
     }
     Ok(())
 }
