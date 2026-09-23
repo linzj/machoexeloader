@@ -11,6 +11,7 @@
 # 属于那个项目,其 statusLine 又引用 ~/.claude/statusline-command.sh 等外部脚本。
 # 生成内容与该文件等价:disableRemoteControl + attribution;statusLine 仅在
 # 对应脚本存在时保留(软引用);选 [d] 时叠加 disableAllHooks。
+# 另加 effortLevel=xhigh:user settings 被排除,/effort 的"存为默认"对下次启动无效。
 # 启动前检测 cwd 的 .claude/settings*.json 是否带 hooks(实测只读 cwd,不向 git 根/父目录找):
 # 有则交互确认——继续执行或切 disableAllHooks 模式。
 # 用法:
@@ -179,6 +180,9 @@ import json, os, sys
 d = {
     "disableRemoteControl": True,
     "attribution": {"commit": "", "pr": ""},
+    # user settings 被 --setting-sources 排除,/effort 存进去的默认值读不到,
+    # 不写这里每次启动都回落到模型默认(Opus 5.5 是 medium)
+    "effortLevel": "xhigh",
 }
 # statusLine 软引用:脚本存在才注入,不硬依赖其他项目的产物
 if os.path.isfile(sys.argv[1]):
