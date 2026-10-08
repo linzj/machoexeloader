@@ -12,6 +12,15 @@ mldr [-v] [-e] [-L dir] <executable> [args...]
   -L dir  额外的 @rpath 搜索目录
 ```
 
+设置 `MLDR_TARGET=<executable>` 时进入目标伪装模式(用于本机策略禁止内核直接执行
+目标二进制的场景,例如经 `scripts/runclaude.sh` 运行的 Claude Code):
+
+- `_NSGetExecutablePath` shim 上报 mldr 自身路径(而非目标路径);目标从该 API 捕获的
+  路径(如 `CLAUDE_CODE_EXECPATH`)之后被以任意 argv[0] 直接 exec 时都会回到 mldr
+- mldr 进程的 argv[0] basename 不是 `mldr` 时,把整份 argv 原样转发给 `MLDR_TARGET`,
+  目标由此看到原始的 argv[0](Claude Code 的 find/grep 包装器以 `ARGV0=bfs/ugrep`
+  调用,目标按 argv[0] 分发到内嵌的 bfs/ugrep)
+
 ## 加载流程
 
 ```
@@ -80,6 +89,8 @@ mldr [-v] [-e] <目标> [args...]
 - `hello_classic` — 经典 LC_DYLD_INFO fixups(`-Wl,-no_fixup_chains`)
 - `greettest` — 依赖链:main → @rpath/libgreet.dylib → @loader_path/libsuffix.dylib
   (自加载 dylib、两级绑定、数据 rebase)
+- `execpath` — `_NSGetExecutablePath`/`_NSGetArgc`/`_NSGetArgv` shim 与原生输出一致
+- `multicall-forward` — `MLDR_TARGET` + 非 mldr argv[0] 时 argv 原样转发给目标
 - `claude-load-only` — 对 Claude Code 的 207MB arm64 原生二进制(Bun/JSC,
   6 个段、96444 个 chained fixup、142 个 TLV 描述符)做 `mldr -e` 全量加载
 - `claude-exec-version` — 经 mldr **完整执行**该二进制:`mldr <claude> --version`

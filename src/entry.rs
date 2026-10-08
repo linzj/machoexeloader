@@ -2,6 +2,7 @@
 //! the jump that finally sets the target's PC.
 
 use std::ffi::{CStr, CString, c_char, c_int};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 use crate::image::ImageKind;
@@ -22,13 +23,21 @@ static ARGC_SHIM: AtomicI32 = AtomicI32::new(0);
 static ARGV_SHIM: AtomicPtr<c_char> = AtomicPtr::new(std::ptr::null_mut());
 static EXEC_PATH: AtomicPtr<c_char> = AtomicPtr::new(std::ptr::null_mut());
 static DYLD_PRIVATE: usize = 0;
+static EXEC_PATH_OVERRIDE: OnceLock<Option<CString>> = OnceLock::new();
+
+/// Overrides the path reported by the _NSGetExecutablePath shim. Set in
+/// MLDR_TARGET mode so the target sees this loader's own path instead of
+/// argv[0]; see run() in main.rs.
+pub fn set_exec_path_override(path: Option<String>) {
+    let _ = EXEC_PATH_OVERRIDE.set(path.map(|s| CString::new(s).unwrap_or_default()));
+}
 
 /// Symbols we intercept instead of resolving through the host.
 pub fn shim_lookup(name: &str) -> Option<usize> {
     match name {
-        "_NSGetArgc" => Some(nsgetargc as *const () as usize),
-        "_NSGetArgv" => Some(nsgetargv as *const () as usize),
-        "_NSGetExecutablePath" => Some(nsgetexecutablepath as *const () as usize),
+        "__NSGetArgc" => Some(nsgetargc as *const () as usize),
+        "__NSGetArgv" => Some(nsgetargv as *const () as usize),
+        "__NSGetExecutablePath" => Some(nsgetexecutablepath as *const () as usize),
         "dyld_stub_binder" => Some(stub_binder_placeholder as *const () as usize),
         "__dyld_private" => Some(std::ptr::addr_of!(DYLD_PRIVATE) as usize),
         // TLV descriptors' thunk word is a bind to __tlv_bootstrap; ours does
@@ -111,7 +120,10 @@ fn run_entry(reg: &Registry, argv: Vec<String>) -> ! {
     let mut argv_ptrs: Vec<*const c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
     let envp = unsafe { crate::sys::environ };
-    let exec_path = cargs.first().cloned().unwrap_or_default();
+    let exec_path = match EXEC_PATH_OVERRIDE.get().and_then(|o| o.as_ref()) {
+        Some(p) => p.clone(),
+        None => absolutize(&cargs.first().cloned().unwrap_or_default()),
+    };
     let apple: Vec<*const c_char> = vec![exec_path.as_ptr(), std::ptr::null()];
 
     ARGC_SHIM.store((argv_ptrs.len() - 1) as i32, Ordering::Relaxed);
@@ -144,6 +156,31 @@ fn run_entry(reg: &Registry, argv: Vec<String>) -> ! {
         )
     };
     std::process::exit(ret);
+}
+
+/// The real _NSGetExecutablePath reports an absolute, dot-normalized path
+/// (as invoked, without resolving symlinks); match that for argv[0].
+fn absolutize(raw: &CString) -> CString {
+    let s = raw.to_string_lossy();
+    let abs = if s.starts_with('/') {
+        s.into_owned()
+    } else {
+        match std::env::current_dir() {
+            Ok(d) => format!("{}/{}", d.to_string_lossy(), s),
+            Err(_) => s.into_owned(),
+        }
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for comp in abs.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    CString::new(format!("/{}", out.join("/"))).unwrap_or_default()
 }
 
 /// Dependencies before dependents; the main executable runs last.

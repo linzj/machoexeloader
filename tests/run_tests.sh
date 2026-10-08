@@ -13,6 +13,7 @@ $CC $CFLAGS -o tests/out/exitcode tests/targets/exitcode.c
 $CC $CFLAGS -o tests/out/tls tests/targets/tls.c
 $CC $CFLAGS -o tests/out/threads tests/targets/threads.c
 $CC $CFLAGS -o tests/out/ctor tests/targets/ctor.c
+$CC $CFLAGS -o tests/out/execpath tests/targets/execpath.c
 # Classic LC_DYLD_INFO fixups instead of chained fixups.
 $CC $CFLAGS -Wl,-no_fixup_chains -o tests/out/hello_classic tests/targets/hello.c
 # Dependency chain: greettest -> @rpath/libgreet.dylib -> @loader_path/libsuffix.dylib
@@ -60,6 +61,22 @@ run_case threads
 run_case ctor
 run_case hello_classic
 run_case greettest
+run_case execpath
+run_case execpath a b
+
+# Multicall forwarding (MLDR_TARGET set, argv[0] != mldr): argv goes to the
+# target unchanged. Claude Code's find/grep wrappers rely on this.
+set +e
+MLDR_TARGET=./tests/out/exitcode bash -c 'exec -a ugrep ./target/debug/mldr 42' >/dev/null 2>&1
+mc_code=$?
+set -e
+if [ "$mc_code" -eq 42 ]; then
+    echo "PASS multicall-forward (exit 42)"
+    pass=$((pass + 1))
+else
+    echo "FAIL multicall-forward: exit $mc_code"
+    fail=$((fail + 1))
+fi
 
 # Claude Code native binary (207MB, Bun/JSC, 96k+ fixups, TLS).
 # Not in repo; prepare with: npm install --prefix tmp/claude-code @anthropic-ai/claude-code@2.1.270

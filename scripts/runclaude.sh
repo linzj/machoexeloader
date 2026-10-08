@@ -295,6 +295,15 @@ if [ -n "$hook_summary" ]; then
   fi
 fi
 
+if [ "$PLATFORM" = darwin-arm64 ]; then
+  # 会话模式:本机策略拦截 claude 二进制原生执行,Bash 工具的 find/grep 包装器
+  # 又会以 ARGV0=bfs/ugrep 直接内核执行 CLAUDE_CODE_EXECPATH。mldr 在
+  # MLDR_TARGET 模式下让 shim 上报自身路径,被以非 mldr argv[0] 执行时把
+  # 参数原样转发给 MLDR_TARGET(目标据此看到 "ugrep"/"bfs")
+  MLDR_TARGET=$CLAUDE_ARG
+  export MLDR_TARGET
+fi
+
 exec "$LOADER" $LOADER_FLAGS "$CLAUDE_ARG" \
   --settings "$settings_arg" \
   --setting-sources project,local \

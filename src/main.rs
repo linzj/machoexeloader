@@ -37,6 +37,27 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
+    // MLDR_TARGET mode (used when a target must never be kernel-exec'd, e.g.
+    // policy blocks running it natively): the exec path shim reports mldr's
+    // own path, so paths a target captures from _NSGetExecutablePath and later
+    // re-execs (Claude Code's find/grep wrappers use ARGV0=bfs/ugrep) land
+    // back in mldr, which forwards argv unchanged to MLDR_TARGET.
+    entry::set_exec_path_override(match std::env::var_os("MLDR_TARGET") {
+        Some(_) => std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        None => None,
+    });
+    let looks_like_mldr = std::path::Path::new(args.first().map(String::as_str).unwrap_or(""))
+        .file_name()
+        .is_some_and(|n| n == "mldr");
+    if !looks_like_mldr {
+        if let Ok(target) = std::env::var("MLDR_TARGET") {
+            if !target.is_empty() {
+                return loader::run_program(&target, args.to_vec(), false, &[]);
+            }
+        }
+    }
     let mut verbose = false;
     let mut load_only = false;
     let mut extra_rpaths = Vec::new();
