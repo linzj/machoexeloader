@@ -68,7 +68,7 @@ elldr [-v] [-e] <目标> [args...]
 | `dladdr` | 目标范围内的 PC 解析到目标路径/最近导出符号 |
 | `readlink`/`readlinkat`/`open`/`open64`/`openat`/`openat64`/`fopen`/`fopen64` | `/proc/self/exe` → 目标路径(Bun selfExePath) |
 | `syscall` | 同上路径的 readlinkat/openat/statx 重定向(Zig 风格直接调用 libc syscall() 的路径) |
-| `program_invocation_name`/`program_invocation_short_name`(数据) | 启动时改写宿主 libc 内指针 + 目标 GOT 指向 elldr 持有的目标名 |
+| `program_invocation_name`/`program_invocation_short_name`(数据;含强符号别名 `__progname_full`/`__progname`,非 PIE 目标实际 COPY 重定位的是别名) | 启动时改写宿主 libc 内指针 + 目标 GOT/COPY 指向 elldr 持有的目标名 |
 | `__tls_get_addr` | 转发宿主;被调用则报错级日志(正常不可达;出现即目标用了动态 TLS) |
 
 诊断:环境变量 `ELLDR_LOG=<path>` 将全部诊断落文件;`-v` 打开详细日志;崩溃时
@@ -137,6 +137,9 @@ cd elldr && ./tests/run_tests.sh
 - `ifunc` — IRELATIVE resolver(目标自身 ifunc + 宿主 glibc ifunc)
 - `reloc` — .data 函数指针表(R_X86_64_64)
 - `phdr` — dl_iterate_phdr 看到自身镜像 + readlink(/proc/self/exe) 指向目标
+- `exeid` — 进程身份:readlink/readlinkat/`syscall()`/open 各路径的 /proc/self/exe
+  均解析到目标 + program_invocation_*(覆盖 `__progname`/`__progname_full` 别名的
+  COPY 重定位路径)
 - `fork` — fork+exec 子进程路径
 - `claude-load-only` — 对 214MB 目标做 `elldr -e` 全量加载
 - `claude-exec-version` / `claude-exec-help` — 与原生逐字节 diff(本环境允许原生

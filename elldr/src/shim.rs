@@ -252,9 +252,12 @@ pub fn shim_for(name: &str) -> Option<usize> {
         "fopen" | "fopen64" => shim_fopen as *const () as usize,
         "syscall" => shim_syscall as *const () as usize,
         "__tls_get_addr" => shim_tls_get_addr as *const () as usize,
-        // data-symbol overrides: the GOT points at our own pointer variables
-        "program_invocation_name" => &PROG_NAME as *const _ as usize,
-        "program_invocation_short_name" => &PROG_SHORT_NAME as *const _ as usize,
+        // data-symbol overrides: the GOT points at our own pointer variables.
+        // Non-PIE binaries COPY-relocate these via the strong glibc names
+        // __progname_full/__progname (program_invocation_* are weak aliases),
+        // so the aliases must be shimmed too or the copy inherits elldr's.
+        "program_invocation_name" | "__progname_full" => &PROG_NAME as *const _ as usize,
+        "program_invocation_short_name" | "__progname" => &PROG_SHORT_NAME as *const _ as usize,
         _ => return None,
     };
     Some(a)

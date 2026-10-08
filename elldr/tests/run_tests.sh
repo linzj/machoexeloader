@@ -21,6 +21,7 @@ $CC $CFLAGS -o tests/out/ifunc        tests/targets/ifunc.c
 $CC $CFLAGS -o tests/out/reloc        tests/targets/reloc.c
 $CC $CFLAGS -o tests/out/phdr         tests/targets/phdr.c
 $CC $CFLAGS -o tests/out/fork         tests/targets/fork.c
+$CC $CFLAGS -o tests/out/exeid        tests/targets/exeid.c
 
 pass=0
 fail=0
@@ -62,6 +63,7 @@ run_case ifunc
 run_case reloc
 run_case phdr
 run_case fork
+run_case exeid
 
 # ---- claude-*: the real target (Bun single-file executable) ----------------
 CLAUDE="${CLAUDE_BIN:-}"
