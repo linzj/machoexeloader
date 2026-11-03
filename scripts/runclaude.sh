@@ -307,4 +307,4 @@ fi
 exec "$LOADER" $LOADER_FLAGS "$CLAUDE_ARG" \
   --settings "$settings_arg" \
   --setting-sources project,local \
-  --dangerously-skip-permissions "$@"
+  "$@"
