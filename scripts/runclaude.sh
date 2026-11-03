@@ -193,6 +193,25 @@ print(json.dumps(d))
 PYEOF
 }
 
+# 原子替换安装 $1 -> $2:先复制到同目录临时文件,再 rename 覆盖。
+# 不能原地 cp -f:加载器是自己 mmap 目标文件(不经 execve,没有 ETXTBSY 写保护),
+# cp -f 先 O_TRUNC 截断,正在运行的会话里尚未换入/已被回收的代码页随即 SIGBUS
+# (实测:install 重装同版本时把正在跑的 elldr 会话打崩)。rename 换上新 inode,
+# 运行中的进程继续持有旧 inode,不受影响
+install_file() {
+  _tmp=$(dirname "$2")/.$(basename "$2").tmp.$$
+  if cp -f "$1" "$_tmp" && chmod +x "$_tmp" && mv -f "$_tmp" "$2"; then
+    return 0
+  fi
+  rm -f "$_tmp"
+  return 1
+}
+
+# $1 已存在且 sha256 等于 $want(本次 manifest 校验值)时返回 0:无需重装
+already_installed() {
+  [ -f "$1" ] && [ "$(sha256 "$1")" = "$want" ]
+}
+
 do_install() {
   # macOS:官方 installer 经 mldr 运行正常,沿用(会顺带写 PATH/rc);
   # Windows:官方更新器在手动映射下会踩堆损坏,改为"下载->校验->直接替换二进制"
@@ -242,23 +261,30 @@ do_install() {
     "$LOADER" "$bin" install || { echo "install 失败"; return 1; }
   elif [ "$PLATFORM" = linux-x64 ] && [ -d "$HOME/.local/share/claude/versions" ]; then
     # 官方 Linux 布局: 版本文件落 versions/ 目录,bin 为符号链接
-    echo "==> 安装到 $HOME/.local/share/claude/versions/$version ..."
     vdir=$HOME/.local/share/claude/versions
-    cp -f "$bin" "$vdir/$version" || { echo "复制失败"; return 1; }
-    chmod +x "$vdir/$version"
+    if already_installed "$vdir/$version"; then
+      echo "==> $vdir/$version 已安装且校验一致,跳过复制"
+    else
+      echo "==> 安装到 $vdir/$version ..."
+      install_file "$bin" "$vdir/$version" || { echo "复制失败"; return 1; }
+    fi
     ln -sfn "$vdir/$version" "$CLAUDE"
   else
-    echo "==> 安装到 $CLAUDE ..."
-    mkdir -p "$(dirname "$CLAUDE")"
-    [ -e "$CLAUDE" ] && cp -f "$CLAUDE" "$CLAUDE.bak"
-    cp -f "$bin" "$CLAUDE" || { echo "复制失败"; return 1; }
-    chmod +x "$CLAUDE"
+    if already_installed "$CLAUDE"; then
+      # 同版本不重装,也不刷新 .bak(否则会用同版本冲掉上一版的备份)
+      echo "==> $CLAUDE 已是 $version 且校验一致,跳过复制"
+    else
+      echo "==> 安装到 $CLAUDE ..."
+      mkdir -p "$(dirname "$CLAUDE")"
+      [ -e "$CLAUDE" ] && cp -f "$CLAUDE" "$CLAUDE.bak"
+      install_file "$bin" "$CLAUDE" || { echo "复制失败"; return 1; }
+    fi
   fi
   echo "==> 经加载器校验安装结果..."
   if ! "$LOADER" "$CLAUDE_ARG" --version; then
     if [ -e "$CLAUDE.bak" ]; then
       echo "校验失败,回滚" >&2
-      cp -f "$CLAUDE.bak" "$CLAUDE"
+      install_file "$CLAUDE.bak" "$CLAUDE"
     fi
     return 1
   fi
