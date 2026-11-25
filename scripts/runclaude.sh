@@ -12,12 +12,15 @@
 # 生成内容与该文件等价:disableRemoteControl + attribution;statusLine 仅在
 # 对应脚本存在时保留(软引用);选 [d] 时叠加 disableAllHooks。
 # 另加 effortLevel=xhigh:user settings 被排除,/effort 的"存为默认"对下次启动无效。
+# Windows 默认只给 PowerShell 工具(CLAUDE_CODE_USE_POWERSHELL_TOOL=1 + deny Bash):
+# Bash 工具的命令经 Windows 命令行交给 Git Bash,MSYS 拆参数会把 \\ 折半。
 # 启动前检测 cwd 的 .claude/settings*.json 是否带 hooks(实测只读 cwd,不向 git 根/父目录找):
 # 有则交互确认——继续执行或切 disableAllHooks 模式。
 # 用法:
 #   runclaude.sh [claude args...]   启动(未安装时提示先跑 install)
 #   runclaude.sh install            下载官方最新版并校验安装(macOS 走 installer;Windows 直接替换二进制)
 #   RUNCLAUDE_LEGACY=1 runclaude.sh ...   Windows 专用: 用 peldr(旧 shim 模式)代替 pldr
+#   RUNCLAUDE_BASH=1 runclaude.sh ...     Windows 专用: 保留 Bash 工具(默认只有 PowerShell 工具)
 set -u
 
 # 防注入继承:实测 claude 的 Bun 运行时会执行 BUN_OPTIONS 里的 --preload
@@ -50,6 +53,14 @@ case "$(uname -s)" in
       *) echo "peldr 目前仅支持 x64: $(uname -m)" >&2; exit 1 ;;
     esac
     PLATFORM=win32-x64
+    # 只用 PowerShell 工具:Bash 工具以 bash.exe -c "<命令>" 启动,Bun 按微软规则加引号
+    # (反斜杠只在 " 前特殊),MSYS 拆参数时双引号里 \\ -> \,heredoc/单引号里也逃不掉;
+    # PowerShell 工具的命令经环境变量交给 pwsh,反斜杠原样。只 deny Bash 会连带关掉
+    # PowerShell(claude 两个都不给),所以必须同时设 CLAUDE_CODE_USE_POWERSHELL_TOOL=1
+    if [ -z "${RUNCLAUDE_BASH:-}" ]; then
+      export CLAUDE_CODE_USE_POWERSHELL_TOOL=1
+      PWSH_ONLY=1
+    fi
     BIN=claude.exe
     CLAUDE=$HOME/.local/bin/claude.exe
     # 默认 pldr(零 shim 加载器);RUNCLAUDE_LEGACY=1 切回 peldr(旧 shim 模式)
@@ -175,7 +186,7 @@ PYEOF
 
 # 自带生成 settings,以 JSON 字符串形式传给 --settings(gen_settings strict 时叠加 disableAllHooks)
 gen_settings() {
-  "$PY" - "$STATUSLINE" "${1:-}" <<'PYEOF'
+  "$PY" - "$STATUSLINE" "${1:-}" "${PWSH_ONLY:-}" <<'PYEOF'
 import json, os, sys
 d = {
     "disableRemoteControl": True,
@@ -189,6 +200,10 @@ if os.path.isfile(sys.argv[1]):
     d["statusLine"] = {"type": "command", "command": "bash ~/.claude/statusline-command.sh"}
 if len(sys.argv) > 2 and sys.argv[2] == "strict":
     d["disableAllHooks"] = True
+# Windows 只留 PowerShell 工具(见平台选择处);deny 写在 settings 而不用 --disallowedTools,
+# 后者是变长参数,会把紧跟的提示词也当成工具名吞掉
+if len(sys.argv) > 3 and sys.argv[3] == "1":
+    d["permissions"] = {"deny": ["Bash"]}
 print(json.dumps(d))
 PYEOF
 }
